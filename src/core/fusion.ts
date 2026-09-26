@@ -27,9 +27,27 @@ export interface FusionWeights {
   exposure: number;
   /** ディテール（局所コントラスト）の倍率。1 で標準 */
   detail: number;
+  /** 「適正露出」とみなす明るさ（0..1。原論文は 0.5） */
+  center: number;
+  /** 適正露出の許容幅（原論文は 0.2） */
+  sigma: number;
 }
 
-export const DEFAULT_FUSION_WEIGHTS: FusionWeights = { contrast: 1, saturation: 1, exposure: 1, detail: 1 };
+/**
+ * 既定値は「自然な仕上がり」寄りに調整している。
+ * 原論文の値（コントラスト 1・彩度 1・中心 0.5・幅 0.2）だと暗部が持ち上がりすぎて平坦になり、
+ * 窓の周りのにじみやザラつきが目立つため、
+ * ・適正露出の中心をやや明るめ (0.65) にして、明るい部分は明るいまま・暗い部分は暗いまま残す
+ * ・コントラストと彩度の重みを弱めて、ノイズの多いフレームや派手な色に引っ張られにくくする
+ */
+export const DEFAULT_FUSION_WEIGHTS: FusionWeights = {
+  contrast: 0.3,
+  saturation: 0.3,
+  exposure: 1,
+  detail: 1,
+  center: 0.65,
+  sigma: 0.22,
+};
 
 /**
  * ディテール強調をかけるピラミッドの段。画像サイズに対する相対的な大きさで決めるので、
@@ -45,8 +63,10 @@ export function detailLevels(w: number, h: number, levels: number): number[] {
   return out;
 }
 
-const SIGMA = 0.2;
 const EPS = 1e-12;
+const CLIP_START = 0.92;
+const CLIP_END = 0.99;
+const CLIP_FLOOR = 0.02;
 
 /** フレーム k の重みマップ（未正規化）を out に計算する。gray は作業用 */
 export function computeWeightMap(
@@ -59,7 +79,9 @@ export function computeWeightMap(
   const w = v.width;
   const h = v.height;
   const d = v.frame.data;
-  const k = p.exposure / (2 * SIGMA * SIGMA);
+  const sg = p.sigma;
+  const target = p.center;
+  const k = p.exposure / (2 * sg * sg);
   const ws = p.saturation;
   const wc = p.contrast;
   let o = 0;
@@ -73,12 +95,18 @@ export function computeWeightMap(
       gray[o] = mu;
       let wv = 1;
       if (k !== 0) {
-        const e = (r - 0.5) * (r - 0.5) + (g - 0.5) * (g - 0.5) + (b - 0.5) * (b - 0.5);
+        const e = (r - target) * (r - target) + (g - target) * (g - target) + (b - target) * (b - target);
         wv = Math.exp(-e * k);
       }
       if (ws !== 0) {
         const sat = Math.sqrt(((r - mu) * (r - mu) + (g - mu) * (g - mu) + (b - mu) * (b - mu)) / 3);
         wv *= ws === 1 ? sat : Math.pow(sat, ws);
+      }
+      // 白飛び寸前の画素は、ほかのフレームに階調が残っていればそちらを使うよう強く下げる
+      const m = r > g ? (r > b ? r : b) : g > b ? g : b;
+      if (m > CLIP_START) {
+        const t = m >= CLIP_END ? 1 : (m - CLIP_START) / (CLIP_END - CLIP_START);
+        wv *= CLIP_FLOOR + (1 - CLIP_FLOOR) * (1 - t * t * (3 - 2 * t));
       }
       out[o] = wv;
     }

@@ -213,6 +213,10 @@ const TARGET_STOPS = 4;
 const HIGHLIGHT_LIMIT = 0;
 /** ハイライトを収めるために中間調を暗くしてよい上限 [段] */
 const MAX_DARKEN = 1;
+/** 中間調を明るくしてよい上限 [段]（夜景などを昼のように明るくしすぎないため） */
+const MAX_LIFT = 4;
+/** 自動露出で中間調（ベースの中央値）を合わせる目標のリニア値 */
+const MID_KEY = 0.18;
 
 /**
  * HDR 合成 + トーンマッピングを行い、表示用 16bit RGB (sRGB) を out に書き込む。
@@ -273,11 +277,13 @@ export function toneMapHDR(
   const range = Math.max(1e-3, bHi - bLo);
   const strength = Math.min(1, Math.max(0, params.strength));
   const c = 1 - strength * (1 - Math.min(1, TARGET_STOPS / range));
-  // 中間調は基準フレームを表示したときと同じ明るさに保ち、ハイライトが収まらない分だけ暗くする
+  // 中間調は自動露出で適正な明るさ（MID_KEY）へ。ただし基準フレームの見た目から
+  // 大きく離れすぎないようにし、ハイライトが収まらない分だけ暗くする
   const displayGain = views[0].frame.encoding === 'linear' ? RAW_DISPLAY_GAIN : 1;
   const keepMid = bMid + Math.log2(displayGain);
+  const autoMid = Math.min(keepMid + MAX_LIFT, Math.max(keepMid - MAX_DARKEN, Math.log2(MID_KEY)));
   const fitHighlight = HIGHLIGHT_LIMIT - (bHi - bMid) * c;
-  const anchor = Math.max(keepMid - MAX_DARKEN, Math.min(keepMid, fitHighlight));
+  const anchor = Math.max(keepMid - MAX_DARKEN, Math.min(autoMid, fitHighlight));
   const detail = params.detail;
   progress(0.5);
 

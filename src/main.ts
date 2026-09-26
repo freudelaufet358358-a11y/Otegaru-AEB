@@ -1,6 +1,7 @@
 import './style.css';
 import { ensureCrossOriginIsolation } from './coi';
 import { readExif, formatShutter, type ExposureInfo } from './core/exif';
+import { DEFAULT_FUSION_WEIGHTS } from './core/fusion';
 import { isRawFile, makeThumbnail, RAW_ACCEPT, RawDecoder } from './raw';
 import type { ExportFormat, FromWorker, LoupeMode, ManualAdjust, Mode, PreparedInfo, RenderParams, ToWorker } from './worker/protocol';
 
@@ -500,6 +501,7 @@ const sliders = {
   fusionDetail: $<HTMLInputElement>('fusion-detail'),
   toneStrength: $<HTMLInputElement>('tone-strength'),
   toneDetail: $<HTMLInputElement>('tone-detail'),
+  wCenter: $<HTMLInputElement>('w-center'),
   wContrast: $<HTMLInputElement>('w-contrast'),
   wSaturation: $<HTMLInputElement>('w-saturation'),
   wExposure: $<HTMLInputElement>('w-exposure'),
@@ -513,6 +515,7 @@ const formats: Partial<Record<keyof typeof sliders, (v: number) => string>> = {
   amount: (v) => `${v}%`,
   fusionDetail: (v) => `${(v / 100).toFixed(2)}×`,
   toneDetail: (v) => `${(v / 100).toFixed(2)}×`,
+  wCenter: (v) => (v / 100).toFixed(2),
   wContrast: (v) => (v / 100).toFixed(2),
   wSaturation: (v) => (v / 100).toFixed(2),
   wExposure: (v) => (v / 100).toFixed(2),
@@ -530,6 +533,8 @@ function currentParams(): RenderParams {
     mode,
     amount: num(sliders.amount) / 100,
     fusion: {
+      ...DEFAULT_FUSION_WEIGHTS,
+      center: num(sliders.wCenter) / 100,
       contrast: num(sliders.wContrast) / 100,
       saturation: num(sliders.wSaturation) / 100,
       exposure: num(sliders.wExposure) / 100,
