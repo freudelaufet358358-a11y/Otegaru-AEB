@@ -1,0 +1,23 @@
+{
+  "name": "otegaru-aeb",
+  "private": true,
+  "version": "1.0.0",
+  "description": "ブラウザだけで動くお手軽AEB（オートブラケット）合成アプリ。Canon EOS R6 Mark II の CR3 RAW に対応。",
+  "type": "module",
+  "scripts": {
+    "vendor": "node scripts/copy-libraw.mjs",
+    "dev": "npm run vendor && vite",
+    "build": "npm run vendor && tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "libraw-wasm": "1.6.0"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vite": "^8.3.1",
+    "vitest": "^5.0.2"
+  }
+}

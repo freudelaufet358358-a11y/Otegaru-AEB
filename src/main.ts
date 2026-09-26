@@ -1,0 +1,731 @@
+import './style.css';
+import { ensureCrossOriginIsolation } from './coi';
+import { readExif, formatShutter, type ExposureInfo } from './core/exif';
+import { isRawFile, makeThumbnail, RAW_ACCEPT, RawDecoder } from './raw';
+import type { ExportFormat, FromWorker, Mode, PreparedInfo, RenderParams, ToWorker } from './worker/protocol';
+
+/** プレビューの長辺 (px) */
+const PREVIEW_SIDE = 1600;
+
+const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
+
+const el = {
+  banner: $('banner'),
+  stage: $('stage'),
+  dropzone: $('dropzone'),
+  viewer: $('viewer'),
+  canvasWrap: $('canvas-wrap'),
+  result: $<HTMLCanvasElement>('canvas-result'),
+  before: $<HTMLCanvasElement>('canvas-before'),
+  handle: $('compare-handle'),
+  labels: $('compare-labels'),
+  busy: $('busy'),
+  busyLabel: $('busy-label'),
+  busyBar: $('busy-bar'),
+  toolbar: $('stage-toolbar'),
+  compare: $<HTMLButtonElement>('toggle-compare'),
+  info: $('stage-info'),
+  miniSpinner: $('mini-spinner'),
+  fileList: $<HTMLUListElement>('file-list'),
+  fileCount: $('file-count'),
+  fileInput: $<HTMLInputElement>('file-input'),
+  rawSize: $<HTMLSelectElement>('raw-size'),
+  align: $<HTMLInputElement>('align'),
+  modeHint: $('mode-hint'),
+  exportBtn: $<HTMLButtonElement>('export'),
+  exportFormat: $<HTMLSelectElement>('export-format'),
+  exportSize: $<HTMLSelectElement>('export-size'),
+  exportQuality: $<HTMLInputElement>('export-quality'),
+  qualityRow: $('quality-row'),
+  exportHint: $('export-hint'),
+  help: $<HTMLDialogElement>('help'),
+};
+
+const MODE_HINTS: Record<Mode, string> = {
+  fusion: '各写真の「ちょうど良く写っている部分」を自然につなぎ合わせます。迷ったらこちら。',
+  hdr: '露出の違いから広い明暗差を再現し、暗部と明部をしっかり起こした HDR 調に仕上げます（RAW 向け）。',
+};
+
+// ---------------------------------------------------------------------------
+// 合成ワーカーとの通信
+
+const worker = new Worker(new URL('./worker/process.worker.ts', import.meta.url), { type: 'module' });
+
+type Pending = {
+  resolve: (m: FromWorker) => void;
+  reject: (e: Error) => void;
+  onProgress?: (label: string, fraction: number) => void;
+};
+let reqSeq = 0;
+const pending = new Map<number, Pending>();
+const addWaiters = new Map<string, { resolve: (m: Extract<FromWorker, { type: 'added' }>) => void; reject: (e: Error) => void }>();
+
+worker.onmessage = (ev: MessageEvent<FromWorker>) => {
+  const m = ev.data;
+  switch (m.type) {
+    case 'added': {
+      addWaiters.get(m.id)?.resolve(m);
+      addWaiters.delete(m.id);
+      break;
+    }
+    case 'addFailed': {
+      addWaiters.get(m.id)?.reject(new Error(m.message));
+      addWaiters.delete(m.id);
+      break;
+    }
+    case 'progress':
+      pending.get(m.reqId)?.onProgress?.(m.label, m.fraction);
+      break;
+    case 'error': {
+      pending.get(m.reqId)?.reject(new Error(m.message));
+      pending.delete(m.reqId);
+      break;
+    }
+    default: {
+      pending.get(m.reqId)?.resolve(m);
+      pending.delete(m.reqId);
+    }
+  }
+};
+worker.onerror = (e) => {
+  console.error(e);
+  toast('処理中に問題が発生しました。メモリ不足の可能性があります（RAW を 1/2 サイズにすると軽くなります）', true);
+};
+
+function send(msg: ToWorker, transfer: Transferable[] = []): void {
+  worker.postMessage(msg, transfer);
+}
+
+function request<T extends FromWorker['type']>(
+  build: (reqId: number) => ToWorker,
+  onProgress?: (label: string, fraction: number) => void,
+): Promise<Extract<FromWorker, { type: T }>> {
+  const reqId = ++reqSeq;
+  return new Promise((resolve, reject) => {
+    pending.set(reqId, { resolve: resolve as (m: FromWorker) => void, reject, onProgress });
+    send(build(reqId));
+  });
+}
+
+function addToWorker(msg: ToWorker & { id: string }, transfer: Transferable[] = []) {
+  return new Promise<Extract<FromWorker, { type: 'added' }>>((resolve, reject) => {
+    addWaiters.set(msg.id, { resolve, reject });
+    send(msg, transfer);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 画像の管理
+
+type Status = 'loading' | 'ready' | 'error';
+
+interface Item {
+  id: string;
+  file: File;
+  raw: boolean;
+  status: Status;
+  message: string;
+  exif?: ExposureInfo;
+  thumb?: string;
+  /** 読み込み直すたびに増える。古い読み込み結果を捨てるために使う */
+  version: number;
+  el: HTMLLIElement;
+}
+
+const items = new Map<string, Item>();
+let idSeq = 0;
+let generation = 0;
+let prepared: PreparedInfo | null = null;
+
+const IMAGE_EXT = /\.(jpe?g|png|webp|avif|gif|bmp|tiff?|heic|heif|jxl)$/i;
+
+function addFiles(files: File[]): void {
+  const accepted = files.filter((f) => isRawFile(f) || f.type.startsWith('image/') || IMAGE_EXT.test(f.name));
+  const skipped = files.length - accepted.length;
+  if (skipped > 0) toast(`${skipped} 件のファイルは画像ではないため読み込みませんでした`);
+  for (const file of accepted) {
+    const item: Item = {
+      id: `f${++idSeq}`,
+      file,
+      raw: isRawFile(file),
+      status: 'loading',
+      message: '待機中…',
+      version: 0,
+      el: document.createElement('li'),
+    };
+    items.set(item.id, item);
+    renderItem(item);
+    el.fileList.append(item.el);
+    if (item.raw) queueRaw(item);
+    else void loadImage(item);
+  }
+  if (accepted.length) onItemsChanged();
+}
+
+let rawChain: Promise<void> = Promise.resolve();
+let rawQueued = 0;
+let decoder: RawDecoder | null = null;
+
+function queueRaw(item: Item): void {
+  rawQueued++;
+  const version = ++item.version;
+  rawChain = rawChain
+    .then(() => loadRaw(item, version))
+    .finally(() => {
+      if (--rawQueued === 0) {
+        // WASM のメモリを解放する
+        decoder?.dispose();
+        decoder = null;
+      }
+    });
+}
+
+async function loadRaw(item: Item, version: number): Promise<void> {
+  // 削除された、または読み込み直しが予約された場合は結果を使わない
+  const stale = () => items.get(item.id) !== item || item.version !== version;
+  if (stale()) return;
+  try {
+    decoder ??= new RawDecoder();
+    setStatus(item, 'loading', 'RAW を開いています…');
+    const meta = await decoder.open(item.file, el.rawSize.value === 'half');
+    item.exif = meta.exif;
+    if (meta.preview && !item.thumb) item.thumb = await makeThumbnail(meta.preview, meta.flip).catch(() => undefined);
+    setStatus(item, 'loading', '現像中…');
+    const img = await decoder.develop();
+    if (stale()) return;
+    await addToWorker(
+      { type: 'addRaw', id: item.id, name: item.file.name, width: img.width, height: img.height, data: img.data, exif: meta.exif },
+      [img.data.buffer],
+    );
+    if (stale()) return;
+    setStatus(item, 'ready', '');
+  } catch (e) {
+    if (stale()) return;
+    setStatus(item, 'error', errorMessage(e));
+  }
+  onItemsChanged();
+}
+
+async function loadImage(item: Item): Promise<void> {
+  try {
+    setStatus(item, 'loading', '読み込み中…');
+    item.exif = readExif(await item.file.slice(0, 512 * 1024).arrayBuffer());
+    item.thumb = await makeThumbnail(item.file).catch(() => undefined);
+    renderItem(item);
+    const res = await addToWorker({ type: 'addFile', id: item.id, name: item.file.name, file: item.file });
+    item.exif = { ...res.exif, ...item.exif };
+    setStatus(item, 'ready', '');
+  } catch (e) {
+    setStatus(item, 'error', errorMessage(e));
+  }
+  onItemsChanged();
+}
+
+function removeItem(id: string): void {
+  const item = items.get(id);
+  if (!item) return;
+  items.delete(id);
+  item.el.remove();
+  if (item.thumb) URL.revokeObjectURL(item.thumb);
+  send({ type: 'remove', id });
+  onItemsChanged();
+}
+
+function setStatus(item: Item, status: Status, message: string): void {
+  item.status = status;
+  item.message = message;
+  renderItem(item);
+  updateLoadingOverlay();
+}
+
+function renderItem(item: Item): void {
+  const li = item.el;
+  li.className = `file ${item.status === 'error' ? 'error' : ''} ${prepared?.referenceId === item.id ? 'reference' : ''}`;
+  li.replaceChildren();
+  const img = document.createElement('img');
+  img.className = 'thumb';
+  img.alt = '';
+  if (item.thumb) img.src = item.thumb;
+  const meta = document.createElement('div');
+  meta.className = 'file-meta';
+  const name = document.createElement('div');
+  name.className = 'file-name';
+  name.textContent = item.file.name;
+  name.title = item.file.name;
+  const sub = document.createElement('div');
+  sub.className = 'file-sub';
+  sub.textContent = item.status === 'ready' ? exposureText(item.exif) : item.message;
+  meta.append(name, sub);
+  const side = document.createElement('div');
+  side.className = 'file-side';
+  if (item.status === 'loading') {
+    const dot = document.createElement('span');
+    dot.className = 'loading-dot';
+    side.append(dot);
+  }
+  const ev = prepared?.relativeEv[item.id];
+  if (item.status === 'ready' && ev !== undefined) {
+    const badge = document.createElement('span');
+    const isRef = prepared!.referenceId === item.id;
+    badge.className = `ev ${isRef ? 'ref' : ''}`;
+    badge.textContent = isRef ? '基準' : formatEv(ev);
+    badge.title = isRef ? '合成の基準（中間の露出）' : '基準との露出差（画像から推定）';
+    side.append(badge);
+  }
+  const rm = document.createElement('button');
+  rm.type = 'button';
+  rm.className = 'remove';
+  rm.textContent = '×';
+  rm.title = '削除';
+  rm.setAttribute('aria-label', `${item.file.name} を削除`);
+  rm.onclick = () => removeItem(item.id);
+  side.append(rm);
+  li.append(img, meta, side);
+}
+
+function exposureText(e?: ExposureInfo): string {
+  if (!e) return '';
+  const parts: string[] = [];
+  if (e.exposureTime) parts.push(formatShutter(e.exposureTime));
+  if (e.fNumber) parts.push(`f/${Math.round(e.fNumber * 10) / 10}`);
+  if (e.iso) parts.push(`ISO${e.iso}`);
+  if (!parts.length && e.exposureBias !== undefined) parts.push(`補正 ${formatEv(e.exposureBias)}`);
+  return parts.join(' · ') || '露出情報なし';
+}
+
+function formatEv(ev: number): string {
+  const r = Math.round(ev * 10) / 10;
+  if (Math.abs(r) < 0.05) return '±0EV';
+  return `${r > 0 ? '+' : '−'}${Math.abs(r).toFixed(1)}EV`;
+}
+
+function readyItems(): Item[] {
+  return [...items.values()].filter((i) => i.status === 'ready');
+}
+
+function loadingItems(): Item[] {
+  return [...items.values()].filter((i) => i.status === 'loading');
+}
+
+function onItemsChanged(): void {
+  generation++;
+  prepared = null;
+  const all = [...items.values()];
+  el.fileCount.textContent = all.length ? `${all.length} 枚` : '';
+  for (const item of all) renderItem(item);
+  const hasItems = all.length > 0;
+  el.dropzone.hidden = hasItems && readyItems().length >= 2;
+  updateLoadingOverlay();
+  updateExportState();
+  if (!loadingItems().length) {
+    if (readyItems().length >= 2) scheduleProcess();
+    else {
+      showViewer(false);
+      if (readyItems().length === 1) toast('露出の違う写真をもう 1 枚以上追加してください');
+    }
+  }
+}
+
+function updateLoadingOverlay(): void {
+  const all = [...items.values()];
+  const loading = loadingItems();
+  if (loading.length) {
+    const done = all.length - loading.length;
+    const current = loading.find((i) => i.message && i.message !== '待機中…');
+    showBusy(`画像を読み込み中 ${done + 1}/${all.length}${current ? `（${current.message.replace('…', '')}）` : ''}`, done / all.length);
+  } else if (!processing) {
+    hideBusy();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 合成とプレビュー
+
+let processTimer = 0;
+let processing = false;
+
+function scheduleProcess(): void {
+  // 読み込み完了から合成開始までの間もオーバーレイを出したままにする
+  processing = true;
+  showBusy('準備中…', 0);
+  clearTimeout(processTimer);
+  processTimer = window.setTimeout(() => void runProcess(), 120);
+}
+
+async function runProcess(): Promise<void> {
+  if (loadingItems().length || readyItems().length < 2) {
+    processing = false;
+    updateLoadingOverlay();
+    return;
+  }
+  const gen = generation;
+  processing = true;
+  showBusy('準備中…', 0);
+  try {
+    const res = await request<'prepared'>(
+      (reqId) => ({ type: 'prepare', reqId, align: el.align.checked, previewSide: PREVIEW_SIDE }),
+      (label, f) => showBusy(label, f),
+    );
+    if (gen !== generation) return;
+    prepared = res.info;
+    drawRGBA(el.before, res.reference, res.info.previewWidth, res.info.previewHeight);
+    if (maxShift(res.info) > Math.max(res.info.width, res.info.height) * 0.015) {
+      toast('位置のずれが大きい画像があります。同じ構図で撮ったブラケット写真か確認してください');
+    }
+    // 暗い→明るい順に並べ替える
+    for (const id of res.info.order) {
+      const item = items.get(id);
+      if (item) el.fileList.append(item.el);
+    }
+    for (const item of items.values()) {
+      if (item.status !== 'ready') el.fileList.append(item.el);
+      renderItem(item);
+    }
+    showBusy('合成中…', 0);
+    await renderOnce(gen, true);
+  } catch (e) {
+    if (gen === generation) {
+      toast(errorMessage(e), true);
+      showViewer(false);
+      el.dropzone.hidden = false;
+    }
+  } finally {
+    processing = false;
+    if (!loadingItems().length) hideBusy();
+    updateExportState();
+  }
+}
+
+let renderInFlight = false;
+let renderWanted = false;
+
+function requestRender(): void {
+  if (!prepared) return;
+  renderWanted = true;
+  if (!renderInFlight) void renderLoop();
+}
+
+async function renderLoop(): Promise<void> {
+  renderInFlight = true;
+  el.miniSpinner.hidden = false;
+  while (renderWanted && prepared) {
+    renderWanted = false;
+    await renderOnce(generation, false);
+  }
+  el.miniSpinner.hidden = true;
+  renderInFlight = false;
+}
+
+async function renderOnce(gen: number, showProgress: boolean): Promise<void> {
+  const params = currentParams();
+  try {
+    const res = await request<'rendered'>(
+      (reqId) => ({ type: 'render', reqId, params }),
+      showProgress ? (label, f) => showBusy(label + '…', f) : undefined,
+    );
+    if (gen !== generation || !prepared) return;
+    drawRGBA(el.result, res.rgba, res.width, res.height);
+    showViewer(true);
+    const shift = maxShift(prepared);
+    el.info.textContent = [
+      `${prepared.width}×${prepared.height}`,
+      `${prepared.order.length}枚`,
+      params.mode === 'fusion' ? 'ナチュラル' : 'HDR',
+      prepared.aligned ? (shift ? `ずれ補正 最大${shift}px` : 'ずれなし') : '位置合わせオフ',
+    ].join(' · ');
+  } catch (e) {
+    if (gen === generation) toast(errorMessage(e), true);
+  }
+}
+
+function maxShift(info: PreparedInfo): number {
+  return Math.max(0, ...Object.values(info.shifts).map(([x, y]) => Math.max(Math.abs(x), Math.abs(y))));
+}
+
+function drawRGBA(canvas: HTMLCanvasElement, rgba: Uint8ClampedArray, w: number, h: number): void {
+  canvas.width = w;
+  canvas.height = h;
+  canvas.getContext('2d')!.putImageData(new ImageData(rgba as Uint8ClampedArray<ArrayBuffer>, w, h), 0, 0);
+}
+
+function showViewer(on: boolean): void {
+  el.viewer.hidden = !on;
+  el.toolbar.hidden = !on;
+  if (on) el.dropzone.hidden = true;
+}
+
+function showBusy(label: string, fraction: number): void {
+  el.busy.hidden = false;
+  el.busyLabel.textContent = label;
+  el.busyBar.style.width = `${Math.round(Math.min(1, Math.max(0, fraction)) * 100)}%`;
+}
+
+function hideBusy(): void {
+  el.busy.hidden = true;
+}
+
+// ---------------------------------------------------------------------------
+// パラメータ
+
+let mode: Mode = 'fusion';
+
+const sliders = {
+  toneStrength: $<HTMLInputElement>('tone-strength'),
+  toneDetail: $<HTMLInputElement>('tone-detail'),
+  wContrast: $<HTMLInputElement>('w-contrast'),
+  wSaturation: $<HTMLInputElement>('w-saturation'),
+  wExposure: $<HTMLInputElement>('w-exposure'),
+  brightness: $<HTMLInputElement>('adj-brightness'),
+  contrast: $<HTMLInputElement>('adj-contrast'),
+  saturation: $<HTMLInputElement>('adj-saturation'),
+  quality: el.exportQuality,
+};
+
+const formats: Partial<Record<keyof typeof sliders, (v: number) => string>> = {
+  toneDetail: (v) => `${(v / 100).toFixed(2)}×`,
+  wContrast: (v) => (v / 100).toFixed(2),
+  wSaturation: (v) => (v / 100).toFixed(2),
+  wExposure: (v) => (v / 100).toFixed(2),
+  brightness: (v) => (v > 0 ? `+${v}` : `${v}`),
+  contrast: (v) => (v > 0 ? `+${v}` : `${v}`),
+  saturation: (v) => (v > 0 ? `+${v}` : `${v}`),
+};
+
+function num(input: HTMLInputElement): number {
+  return Number(input.value);
+}
+
+function currentParams(): RenderParams {
+  return {
+    mode,
+    fusion: {
+      contrast: num(sliders.wContrast) / 100,
+      saturation: num(sliders.wSaturation) / 100,
+      exposure: num(sliders.wExposure) / 100,
+    },
+    tone: { strength: num(sliders.toneStrength) / 100, detail: num(sliders.toneDetail) / 100 },
+    adjust: {
+      brightness: num(sliders.brightness),
+      contrast: num(sliders.contrast),
+      saturation: num(sliders.saturation),
+    },
+  };
+}
+
+function updateOutputs(): void {
+  for (const [key, input] of Object.entries(sliders) as Array<[keyof typeof sliders, HTMLInputElement]>) {
+    const out = input.parentElement?.querySelector('output');
+    if (out) out.textContent = (formats[key] ?? String)(num(input));
+  }
+}
+
+function setMode(m: Mode): void {
+  mode = m;
+  for (const b of document.querySelectorAll<HTMLButtonElement>('.segmented [data-mode]')) {
+    b.setAttribute('aria-checked', String(b.dataset.mode === m));
+  }
+  for (const p of document.querySelectorAll<HTMLElement>('.mode-params')) p.hidden = p.dataset.for !== m;
+  el.modeHint.textContent = MODE_HINTS[m];
+  requestRender();
+}
+
+// ---------------------------------------------------------------------------
+// 比較表示
+
+let comparePos = 0.5;
+
+function setCompare(on: boolean): void {
+  el.compare.setAttribute('aria-pressed', String(on));
+  el.before.hidden = !on;
+  el.handle.hidden = !on;
+  el.labels.hidden = !on;
+  updateCompare();
+}
+
+function updateCompare(): void {
+  const pct = comparePos * 100;
+  el.before.style.clipPath = `inset(0 ${100 - pct}% 0 0)`;
+  el.handle.style.left = `${pct}%`;
+}
+
+function onComparePointer(ev: PointerEvent): void {
+  if (el.before.hidden) return;
+  const r = el.result.getBoundingClientRect();
+  comparePos = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width));
+  updateCompare();
+}
+
+// ---------------------------------------------------------------------------
+// 書き出し
+
+function updateExportState(): void {
+  el.exportBtn.disabled = !prepared;
+  el.qualityRow.hidden = el.exportFormat.value !== 'jpeg';
+}
+
+async function doExport(): Promise<void> {
+  if (!prepared) return;
+  const gen = generation;
+  const format = el.exportFormat.value as ExportFormat;
+  const options = { format, quality: num(el.exportQuality) / 100, maxSide: Number(el.exportSize.value) };
+  const params = currentParams();
+  el.exportBtn.disabled = true;
+  el.exportHint.classList.remove('error');
+  el.exportHint.textContent = '';
+  showBusy('書き出し中…', 0);
+  try {
+    const res = await request<'exported'>(
+      (reqId) => ({ type: 'export', reqId, params, options }),
+      (label, f) => showBusy(`${label}…`, f),
+    );
+    if (gen !== generation) return;
+    const ref = items.get(prepared.referenceId);
+    const base = (ref?.file.name ?? 'image').replace(/\.[^.]+$/, '');
+    const ext = format === 'jpeg' ? 'jpg' : format === 'png' ? 'png' : 'tif';
+    download(res.blob, `${base}_${params.mode === 'hdr' ? 'HDR' : 'AEB'}.${ext}`);
+    el.exportHint.textContent = `${res.width}×${res.height}（${formatBytes(res.blob.size)}）を保存しました · ${(res.elapsed / 1000).toFixed(1)} 秒`;
+  } catch (e) {
+    el.exportHint.classList.add('error');
+    el.exportHint.textContent = errorMessage(e);
+  } finally {
+    hideBusy();
+    updateExportState();
+  }
+}
+
+function download(blob: Blob, name: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+function formatBytes(n: number): string {
+  return n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.round(n / 1e3)} KB`;
+}
+
+// ---------------------------------------------------------------------------
+// その他
+
+let toastTimer = 0;
+function toast(message: string, error = false): void {
+  document.querySelector('.toast')?.remove();
+  const t = document.createElement('div');
+  t.className = `toast ${error ? 'error' : ''}`;
+  t.setAttribute('role', 'status');
+  t.textContent = message;
+  document.body.append(t);
+  clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => t.remove(), error ? 8000 : 4000);
+}
+
+function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+function bindEvents(): void {
+  el.fileInput.accept = `image/*,${RAW_ACCEPT}`;
+  $('pick-files').onclick = () => el.fileInput.click();
+  $('add-files').onclick = () => el.fileInput.click();
+  $('clear-files').onclick = () => {
+    for (const id of [...items.keys()]) removeItem(id);
+  };
+  el.fileInput.onchange = () => {
+    addFiles([...(el.fileInput.files ?? [])]);
+    el.fileInput.value = '';
+  };
+
+  // ドラッグ＆ドロップ（ページ全体で受け付ける）
+  let depth = 0;
+  window.addEventListener('dragenter', (e) => {
+    if (!e.dataTransfer?.types.includes('Files')) return;
+    e.preventDefault();
+    depth++;
+    document.body.classList.add('dragging');
+  });
+  window.addEventListener('dragover', (e) => {
+    if (!e.dataTransfer?.types.includes('Files')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  });
+  window.addEventListener('dragleave', () => {
+    if (--depth <= 0) {
+      depth = 0;
+      document.body.classList.remove('dragging');
+    }
+  });
+  window.addEventListener('drop', (e) => {
+    e.preventDefault();
+    depth = 0;
+    document.body.classList.remove('dragging');
+    addFiles([...(e.dataTransfer?.files ?? [])]);
+  });
+
+  el.rawSize.onchange = () => {
+    const raws = [...items.values()].filter((i) => i.raw);
+    for (const item of raws) {
+      send({ type: 'remove', id: item.id });
+      setStatus(item, 'loading', '待機中…');
+      queueRaw(item);
+    }
+    if (raws.length) onItemsChanged();
+  };
+  el.align.onchange = () => {
+    if (readyItems().length >= 2 && !loadingItems().length) scheduleProcess();
+  };
+
+  for (const b of document.querySelectorAll<HTMLButtonElement>('.segmented [data-mode]')) {
+    b.onclick = () => setMode(b.dataset.mode as Mode);
+  }
+  for (const input of Object.values(sliders)) {
+    input.addEventListener('input', () => {
+      updateOutputs();
+      if (input !== sliders.quality) requestRender();
+    });
+    // ダブルクリックで初期値に戻す
+    input.addEventListener('dblclick', () => {
+      input.value = input.defaultValue;
+      input.dispatchEvent(new Event('input'));
+    });
+  }
+  $('reset-adjust').onclick = () => {
+    for (const s of [sliders.brightness, sliders.contrast, sliders.saturation]) s.value = s.defaultValue;
+    updateOutputs();
+    requestRender();
+  };
+
+  el.compare.onclick = () => setCompare(el.compare.getAttribute('aria-pressed') !== 'true');
+  let dragging = false;
+  el.canvasWrap.addEventListener('pointerdown', (e) => {
+    if (el.before.hidden) return;
+    dragging = true;
+    el.canvasWrap.setPointerCapture(e.pointerId);
+    onComparePointer(e);
+  });
+  el.canvasWrap.addEventListener('pointermove', (e) => dragging && onComparePointer(e));
+  el.canvasWrap.addEventListener('pointerup', () => (dragging = false));
+  el.canvasWrap.addEventListener('pointercancel', () => (dragging = false));
+
+  el.exportFormat.onchange = updateExportState;
+  el.exportBtn.onclick = () => void doExport();
+  $('open-help').onclick = () => el.help.showModal();
+}
+
+async function init(): Promise<void> {
+  bindEvents();
+  updateOutputs();
+  setMode('fusion');
+  updateExportState();
+  const isolated = await ensureCrossOriginIsolation();
+  if (!isolated) {
+    el.banner.hidden = false;
+    el.banner.textContent =
+      'このブラウザ環境では RAW の読み込み機能が使えません（JPEG / PNG は使えます）。通常ウィンドウの最新の Chrome / Edge / Firefox / Safari でお試しください。';
+  }
+}
+
+void init();

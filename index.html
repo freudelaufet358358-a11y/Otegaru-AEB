@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>お手軽AEB合成</title>
+    <meta
+      name="description"
+      content="オートブラケット（AEB）で撮った写真をブラウザだけでHDR合成。Canon EOS R6 Mark II の CR3 RAW にも対応。画像は外部に送信されません。"
+    />
+    <meta name="color-scheme" content="dark" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <img src="favicon.svg" alt="" width="28" height="28" />
+        <h1>お手軽AEB合成</h1>
+        <span class="tagline">ブラケット写真をブラウザだけでHDR合成</span>
+      </div>
+      <button type="button" class="link-button" id="open-help">使い方</button>
+    </header>
+
+    <div class="banner" id="banner" hidden></div>
+
+    <main class="layout">
+      <section class="stage" id="stage" aria-label="プレビュー">
+        <div class="dropzone" id="dropzone">
+          <svg class="dropzone-icon" viewBox="0 0 64 64" aria-hidden="true">
+            <rect x="6" y="18" width="30" height="30" rx="6" />
+            <rect x="17" y="13" width="30" height="30" rx="6" />
+            <rect x="28" y="8" width="30" height="30" rx="6" class="accent" />
+          </svg>
+          <p class="dropzone-title">ブラケット撮影した写真をここにドロップ</p>
+          <p class="dropzone-sub">
+            露出を変えて撮った 2〜9 枚をまとめて選んでください<br />
+            <strong>CR3（EOS R6 Mark II など）</strong>・CR2・NEF・ARW・DNG などの RAW、JPEG / PNG に対応
+          </p>
+          <button type="button" class="primary" id="pick-files">ファイルを選択</button>
+          <p class="privacy">🔒 画像はこの端末の中だけで処理され、どこにも送信されません</p>
+        </div>
+
+        <div class="viewer" id="viewer" hidden>
+          <div class="canvas-wrap" id="canvas-wrap">
+            <canvas id="canvas-result"></canvas>
+            <canvas id="canvas-before" hidden></canvas>
+            <div class="compare-handle" id="compare-handle" hidden><span></span></div>
+            <div class="compare-labels" id="compare-labels" hidden>
+              <span>合成前（基準）</span><span>合成後</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="busy" id="busy" hidden>
+          <div class="busy-box">
+            <div class="spinner" aria-hidden="true"></div>
+            <div class="busy-label" id="busy-label">処理中…</div>
+            <div class="bar"><div class="bar-fill" id="busy-bar"></div></div>
+          </div>
+        </div>
+
+        <div class="stage-toolbar" id="stage-toolbar" hidden>
+          <button type="button" class="chip" id="toggle-compare" aria-pressed="false">比較</button>
+          <span class="stage-info" id="stage-info"></span>
+          <span class="mini-spinner" id="mini-spinner" hidden></span>
+        </div>
+      </section>
+
+      <aside class="panel">
+        <section class="card">
+          <h2><span class="step">1</span>画像 <span class="count" id="file-count"></span></h2>
+          <ul class="file-list" id="file-list"></ul>
+          <div class="row">
+            <button type="button" id="add-files">＋ 追加</button>
+            <button type="button" id="clear-files" class="ghost">すべて削除</button>
+          </div>
+          <label class="field">
+            <span>RAW の読み込み</span>
+            <select id="raw-size">
+              <option value="full">フル解像度（高画質）</option>
+              <option value="half">1/2 サイズ（高速・省メモリ）</option>
+            </select>
+          </label>
+        </section>
+
+        <section class="card">
+          <h2><span class="step">2</span>合成</h2>
+          <div class="segmented" role="radiogroup" aria-label="合成方式">
+            <button type="button" role="radio" data-mode="fusion" aria-checked="true">
+              ナチュラル<small>露出フュージョン</small>
+            </button>
+            <button type="button" role="radio" data-mode="hdr" aria-checked="false">
+              HDR<small>トーンマッピング</small>
+            </button>
+          </div>
+          <p class="hint" id="mode-hint"></p>
+          <label class="switch">
+            <input type="checkbox" id="align" checked />
+            <span>自動位置合わせ（手持ち撮影向け）</span>
+          </label>
+
+          <div class="mode-params" data-for="hdr" hidden>
+            <label class="slider"><span>圧縮の強さ</span><input type="range" id="tone-strength" min="0" max="100" value="75" /><output></output></label>
+            <label class="slider"><span>ディテール</span><input type="range" id="tone-detail" min="50" max="250" value="130" /><output></output></label>
+          </div>
+          <details class="mode-params" data-for="fusion">
+            <summary>詳細設定</summary>
+            <label class="slider"><span>細部を重視</span><input type="range" id="w-contrast" min="0" max="200" value="100" /><output></output></label>
+            <label class="slider"><span>色の鮮やかさを重視</span><input type="range" id="w-saturation" min="0" max="200" value="100" /><output></output></label>
+            <label class="slider"><span>適正露出を重視</span><input type="range" id="w-exposure" min="0" max="200" value="100" /><output></output></label>
+          </details>
+        </section>
+
+        <section class="card">
+          <h2><span class="step">3</span>仕上げ <button type="button" class="link-button small" id="reset-adjust">リセット</button></h2>
+          <label class="slider"><span>明るさ</span><input type="range" id="adj-brightness" min="-100" max="100" value="0" /><output></output></label>
+          <label class="slider"><span>コントラスト</span><input type="range" id="adj-contrast" min="-100" max="100" value="0" /><output></output></label>
+          <label class="slider"><span>彩度</span><input type="range" id="adj-saturation" min="-100" max="100" value="0" /><output></output></label>
+        </section>
+
+        <section class="card">
+          <h2><span class="step">4</span>保存</h2>
+          <div class="grid2">
+            <label class="field">
+              <span>形式</span>
+              <select id="export-format">
+                <option value="jpeg">JPEG</option>
+                <option value="png">PNG</option>
+                <option value="tiff">TIFF（16bit）</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>サイズ</span>
+              <select id="export-size">
+                <option value="0">元のサイズ</option>
+                <option value="4000">長辺 4000px</option>
+                <option value="2048">長辺 2048px</option>
+                <option value="1080">長辺 1080px（SNS 向け）</option>
+              </select>
+            </label>
+          </div>
+          <label class="slider" id="quality-row"><span>JPEG 品質</span><input type="range" id="export-quality" min="60" max="100" value="92" /><output></output></label>
+          <button type="button" class="primary wide" id="export" disabled>画像を保存</button>
+          <p class="hint" id="export-hint"></p>
+        </section>
+      </aside>
+    </main>
+
+    <dialog id="help">
+      <form method="dialog">
+        <h2>使い方</h2>
+        <ol>
+          <li>カメラの AEB（オートブラケット）で、露出を変えて撮った写真を 2〜9 枚用意します。</li>
+          <li>写真をまとめてドロップ（またはファイルを選択）すると、自動で位置合わせして合成します。</li>
+          <li>「ナチュラル」は見た目に自然な露出フュージョン、「HDR」は暗部と明部をしっかり起こす HDR 調です。</li>
+          <li>「比較」で合成前と見比べ、仕上げを調整したら「画像を保存」。</li>
+        </ol>
+        <h3>EOS R6 Mark II で撮るときのコツ</h3>
+        <ul>
+          <li>撮影メニューの「露出補正/AEB」で ±2 段・3 枚程度がおすすめ。明暗差が大きい場面は、カスタム機能の「ブラケティング時の撮影枚数」で 5〜7 枚に増やしてください。</li>
+          <li>ドライブを高速連続撮影にすると、1 回シャッターを押し続けるだけでブラケットが撮れ、ずれも小さくなります。</li>
+          <li>CR3 は通常の RAW / C-RAW どちらも読み込めます。HEIF は多くのブラウザで読み込めないため、RAW か JPEG で撮影してください。</li>
+        </ul>
+        <h3>メモ</h3>
+        <ul>
+          <li>処理はすべてブラウザ内（WebAssembly）で行われ、画像がアップロードされることはありません。</li>
+          <li>フル解像度の RAW を多数読み込むとメモリを多く使います。重いときは「RAW の読み込み」を 1/2 サイズにしてください。</li>
+          <li>動いている被写体はブレ（ゴースト）が出ることがあります。</li>
+        </ul>
+        <div class="row end"><button class="primary" value="close">閉じる</button></div>
+      </form>
+    </dialog>
+
+    <input type="file" id="file-input" multiple hidden />
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

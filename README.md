@@ -1,0 +1,94 @@
+# お手軽AEB合成
+
+オートブラケット（AEB）で撮った露出違いの写真を、**ブラウザだけで** HDR 合成する Web アプリです。
+**Canon EOS R6 Mark II の CR3 RAW**（通常 RAW / C-RAW）をそのまま読み込めます。
+画像はすべて端末内（WebAssembly / Web Worker）で処理され、サーバーには送信されません。
+
+## できること
+
+- 写真をまとめてドロップするだけで、並べ替え → 位置合わせ → 合成まで自動
+- 2 つの合成方式
+  - **ナチュラル**（露出フュージョン / Mertens 法）: 各写真の適正に写っている部分を自然につなぐ
+  - **HDR**（トーンマッピング）: RAW のリニアデータから放射輝度を合成し、局所トーンマッピングで暗部・明部を起こす
+- 手持ち撮影向けの自動位置合わせ（MTB 法、露出が違っても比較可能）と共通領域への自動トリミング
+- 露出差は EXIF だけでなく画像そのものから推定（シャッター速度表記の丸め誤差に影響されない）
+- 合成前（基準フレーム）との比較スライダー
+- 仕上げ調整（明るさ・コントラスト・彩度）
+- JPEG（EXIF の機種・撮影日時付き）/ PNG / 16bit TIFF で保存。サイズ指定も可能
+
+### 対応形式
+
+| 種類 | 形式 |
+| --- | --- |
+| RAW | CR3（EOS R6 Mark II など）, CR2, CRW, NEF, ARW, DNG, RAF, ORF, RW2, PEF, SRW ほか LibRaw 対応形式 |
+| 画像 | JPEG, PNG, WebP, AVIF などブラウザが表示できる形式 |
+
+RAW の現像には [LibRaw](https://www.libraw.org/) 0.22 の WebAssembly 版（[libraw-wasm](https://github.com/ybouane/LibRaw-Wasm)）を使っています。
+EOS R6 Mark II は LibRaw の対応機種で、カラーマトリクスも内蔵されています。
+動作確認には同じ 2420 万画素センサーの EOS R8 の CR3（通常 RAW / C-RAW）を使いました。
+
+## 使い方
+
+1. カメラの AEB で露出を変えて 2〜9 枚撮影します（R6 Mark II なら撮影メニューの「露出補正/AEB」で ±2 段・3 枚が目安。明暗差が大きい場面はカスタム機能の「ブラケティング時の撮影枚数」で 5〜7 枚に）。
+2. アプリを開き、写真をまとめてドロップ（または「ファイルを選択」）。
+3. 「ナチュラル」か「HDR」を選び、必要なら仕上げを調整。
+4. 「画像を保存」。
+
+フル解像度の CR3 は 1 枚あたり数秒で現像できます。重い場合は「RAW の読み込み」を「1/2 サイズ」にすると、速く・省メモリになります。
+
+## 開発
+
+```bash
+npm install
+npm run dev       # 開発サーバー (http://localhost:5173)
+npm test          # ユニットテスト (Vitest)
+npm run build     # dist/ に静的ファイルを出力
+npm run preview   # ビルド結果をローカルで確認
+```
+
+`npm run dev` / `npm run build` の前に `node_modules/libraw-wasm/dist` の WASM 一式を `public/vendor/libraw/` にコピーします（バンドラを通すとワーカーや WASM のパスが壊れるため、静的ファイルとして配信しています）。
+
+### 公開（デプロイ）について
+
+LibRaw の WASM はスレッド（`SharedArrayBuffer`）を使うため、ページが**クロスオリジン分離**されている必要があります。
+
+- ヘッダを設定できるサーバーでは次を付けてください（`vite dev` / `vite preview` は設定済み）
+  - `Cross-Origin-Opener-Policy: same-origin`
+  - `Cross-Origin-Embedder-Policy: require-corp`
+- GitHub Pages のようにヘッダを設定できない場合は、同梱のサービスワーカー（`public/coi-serviceworker.js`）が自動で登録され、初回に 1 回だけ再読み込みして有効になります。
+
+GitHub Pages で公開する場合は、リポジトリの **Settings → Pages → Source** を「GitHub Actions」にしてから `main` ブランチに push すると、`.github/workflows/pages.yml` がテスト・ビルド・公開を行います。
+
+## 仕組み
+
+```
+src/
+  main.ts                 UI（ファイル管理・プレビュー・比較・保存）
+  raw.ts                  LibRaw による RAW 現像（リニア 16bit sRGB で取り出す）
+  coi.ts                  クロスオリジン分離の有効化
+  worker/process.worker.ts  合成ワーカー（位置合わせ・プレビュー・書き出し）
+  core/                   画像処理（DOM 非依存・ユニットテスト対象）
+    align.ts              MTB 位置合わせ
+    fusion.ts             露出フュージョン（ラプラシアンピラミッド）
+    hdr.ts                露出比推定・放射輝度合成・ガイデッドフィルタによるトーンマッピング
+    pyramid.ts            ガウシアン／ラプラシアンピラミッド
+    adjust.ts             仕上げ調整
+    tiff.ts / exif.ts     16bit TIFF 書き出し・EXIF 読み書き
+```
+
+- RAW はガンマや自動明るさ補正をかけない**リニアな 16bit** で現像し、HDR 合成ではショットノイズを考慮して露出の長いフレームを重視して合成します。
+- プレビューは長辺 1600px で素早く計算し、保存時にフル解像度で計算し直します。
+- 2400 万画素 × 3 枚をフル解像度で合成すると、メモリを 1〜1.5GB ほど使います。
+
+## 制限事項
+
+- 動いている被写体（人・木の葉・水面など）はゴースト（多重像）が出ることがあります。
+- 位置合わせは平行移動のみです（回転は補正しません）。三脚や高速連写でのブラケット撮影がおすすめです。
+- HEIF（HDR PQ）は多くのブラウザで読み込めないため、RAW か JPEG で撮影してください。
+- スマートフォンではメモリ不足になることがあります。その場合は「1/2 サイズ」や小さい保存サイズをお試しください。
+
+## サードパーティ
+
+- [LibRaw](https://www.libraw.org/)（LGPL-2.1 または CDDL-1.0）
+- [libraw-wasm](https://github.com/ybouane/LibRaw-Wasm)（ISC）
+- [Little CMS](https://www.littlecms.com/)（MIT, libraw-wasm に同梱）
