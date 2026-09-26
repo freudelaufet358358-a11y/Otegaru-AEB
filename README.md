@@ -57,7 +57,7 @@ LibRaw の WASM はスレッド（`SharedArrayBuffer`）を使うため、ペー
   - `Cross-Origin-Embedder-Policy: require-corp`
 - GitHub Pages のようにヘッダを設定できない場合は、同梱のサービスワーカー（`public/coi-serviceworker.js`）が自動で登録され、初回に 1 回だけ再読み込みして有効になります。
 
-GitHub Pages で公開する場合は、リポジトリの **Settings → Pages → Source** を「GitHub Actions」にしてから `main` ブランチに push すると、`.github/workflows/pages.yml` がテスト・ビルド・公開を行います。
+GitHub Pages で公開する場合は、リポジトリの **Settings → Pages → Source** を「GitHub Actions」にしてからデフォルトブランチに push すると、`.github/workflows/pages.yml` がテスト・ビルド・公開を行います（Actions タブから手動実行も可能）。
 
 ## 仕組み
 
