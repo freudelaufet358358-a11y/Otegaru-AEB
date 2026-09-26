@@ -1,14 +1,37 @@
 // 合成処理を担当するワーカー。フレームを保持し、位置合わせ・プレビュー生成・書き出しを行う。
 
-import { toRGB16, toRGBA8 } from '../core/adjust';
-import { alignedViews, alignMTB, commonCrop, toGray8 } from '../core/align';
-import { displayLut, linearLut, LUMA_B, LUMA_G, LUMA_R } from '../core/color';
+import { blendWithReference, toRGB16, toRGBA8, DEFAULT_ADJUSTMENTS } from '../core/adjust';
+import { alignFrames, toGray8 } from '../core/align';
+import { displayLut, linearLut, linearToDisplay, LUMA_B, LUMA_G, LUMA_R, RAW_DISPLAY_GAIN } from '../core/color';
 import { buildExifApp1, exposureValue, formatExifDate, insertExif, readExif, type ExposureInfo } from '../core/exif';
 import { fitSize, fullView, resizeView, rowIndex, type Frame16, type View } from '../core/frame';
 import { exposureFusion, type ProgressFn } from '../core/fusion';
 import { estimateExposures, toneMapHDR } from '../core/hdr';
 import { encodeTiff16 } from '../core/tiff';
-import type { ExportOptions, FromWorker, PreparedInfo, RenderParams, ToWorker } from './protocol';
+import {
+  angleDegrees,
+  apply,
+  compose,
+  IDENTITY,
+  invert,
+  isIntegerTranslation,
+  rotationAbout,
+  sampleBilinear,
+  validCrop,
+  warp,
+  type Rect,
+  type Similarity,
+} from '../core/transform';
+import type {
+  ExportOptions,
+  FrameAlignment,
+  FromWorker,
+  LoupeMode,
+  ManualAdjust,
+  PreparedInfo,
+  RenderParams,
+  ToWorker,
+} from './protocol';
 
 interface Entry {
   id: string;
@@ -21,10 +44,22 @@ interface Prepared {
   info: PreparedInfo;
   entries: Entry[]; // 暗い→明るい順
   refIndex: number;
-  views: View[]; // フル解像度（切り抜き済みビュー）
+  width: number; // フレームの実寸
+  height: number;
+  aligned: boolean;
+  auto: Similarity[]; // 自動位置合わせ（基準の座標 → 各フレームの座標）
+  precise: boolean[];
+  manual: ManualAdjust[];
+  transforms: Similarity[]; // 手動調整込みの最終的な変換
+  crop: Rect;
   exposures: number[]; // 基準 = 1
-  preview: Frame16[];
+  previewSide: number;
+  previewSrc: Frame16[]; // プレビュー用に縮小した元フレーム（ワープ前）
+  preview: Frame16[]; // 位置合わせ済みのプレビュー用フレーム
+  layoutDirty: boolean;
 }
+
+const NO_MANUAL: ManualAdjust = { x: 0, y: 0, rotation: 0 };
 
 const ctx = self as unknown as {
   postMessage(msg: FromWorker, transfer?: Transferable[]): void;
@@ -49,7 +84,7 @@ ctx.onmessage = (ev) => {
           ? err.message
           : String(err);
     if ('reqId' in msg) post({ type: 'error', reqId: msg.reqId, message });
-    else if ('id' in msg) post({ type: 'addFailed', id: msg.id, message });
+    else if (msg.type === 'addRaw' || msg.type === 'addFile') post({ type: 'addFailed', id: msg.id, message });
     console.error(err);
   });
 };
@@ -75,33 +110,54 @@ async function handle(msg: ToWorker): Promise<void> {
       invalidate();
       break;
     case 'prepare': {
-      const t = performance.now();
       prepared = prepare(msg.align, msg.previewSide, (label, f) => post({ type: 'progress', reqId: msg.reqId, label, fraction: f }));
-      cache = null;
-      const ref = prepared.preview[prepared.refIndex];
-      const rgba = new Uint8ClampedArray(ref.width * ref.height * 4);
-      const lut = displayLut(ref.encoding);
-      const disp = new Uint16Array(ref.data.length);
-      for (let i = 0; i < disp.length; i++) disp[i] = lut[ref.data[i]] * 65535 + 0.5;
-      toRGBA8(disp, { brightness: 0, contrast: 0, saturation: 0 }, rgba);
-      post({ type: 'prepared', reqId: msg.reqId, info: prepared.info, reference: rgba }, [rgba.buffer]);
-      console.debug(`prepare: ${(performance.now() - t).toFixed(0)}ms`);
+      const reference = referenceRGBA(prepared);
+      post({ type: 'prepared', reqId: msg.reqId, info: prepared.info, reference }, [reference.buffer]);
+      break;
+    }
+    case 'setManual': {
+      const p = prepared;
+      if (!p) break;
+      const k = p.entries.findIndex((e) => e.id === msg.id);
+      if (k < 0 || k === p.refIndex) break;
+      p.manual[k] = { ...msg.manual };
+      updateTransforms(p);
+      p.layoutDirty = true;
+      break;
+    }
+    case 'loupe': {
+      const p = requirePrepared();
+      ensureLayout(p);
+      const rgba = loupe(p, msg.id, msg.cx, msg.cy, msg.size, msg.mode);
+      post({ type: 'loupe', reqId: msg.reqId, size: msg.size, rgba }, [rgba.buffer]);
       break;
     }
     case 'render': {
       const p = requirePrepared();
       const t = performance.now();
+      let layout: { info: PreparedInfo; reference: Uint8ClampedArray } | undefined;
+      if (p.layoutDirty) {
+        ensureLayout(p);
+        layout = { info: p.info, reference: referenceRGBA(p) };
+      }
       const key = baseKey(msg.params);
       if (!cache || cache.key !== key) {
         const views = p.preview.map(fullView);
         const display = renderBase(views, p, msg.params, (f) => post({ type: 'progress', reqId: msg.reqId, label: '合成中', fraction: f }));
         cache = { key, display, width: views[0].width, height: views[0].height };
       }
+      let display = cache.display;
+      if (msg.params.amount < 1) {
+        const ref = p.preview[p.refIndex];
+        display = blendWithReference(display, fullView(ref), displayLut(ref.encoding), msg.params.amount, new Uint16Array(display.length));
+      }
       const rgba = new Uint8ClampedArray(cache.width * cache.height * 4);
-      toRGBA8(cache.display, msg.params.adjust, rgba);
+      toRGBA8(display, msg.params.adjust, rgba);
+      const transfer: Transferable[] = [rgba.buffer];
+      if (layout) transfer.push(layout.reference.buffer);
       post(
-        { type: 'rendered', reqId: msg.reqId, width: cache.width, height: cache.height, rgba, elapsed: performance.now() - t },
-        [rgba.buffer],
+        { type: 'rendered', reqId: msg.reqId, width: cache.width, height: cache.height, rgba, elapsed: performance.now() - t, layout },
+        transfer,
       );
       break;
     }
@@ -196,8 +252,9 @@ function prepare(align: boolean, previewSide: number, progress: (label: string, 
     if (Math.abs(mean(b) - target) < Math.abs(mean(a) - target)) refIndex = b;
   }
 
-  // 位置合わせ
-  const shifts: Array<[number, number]> = sorted.map(() => [0, 0]);
+  // 位置合わせ（回転と 1 画素未満のずれまで）
+  const auto: Similarity[] = sorted.map(() => IDENTITY);
+  const precise = sorted.map(() => false);
   if (align) {
     progress('位置合わせ中', 0);
     const refGray = toGray8(sorted[refIndex].frame, displayLut(sorted[refIndex].frame.encoding));
@@ -206,42 +263,139 @@ function prepare(align: boolean, previewSide: number, progress: (label: string, 
     for (let k = 0; k < sorted.length; k++) {
       if (k === refIndex) continue;
       const g = toGray8(sorted[k].frame, displayLut(sorted[k].frame.encoding));
-      shifts[k] = alignMTB(refGray, g, maxShift);
+      const r = alignFrames(refGray, g, maxShift);
+      auto[k] = r.transform;
+      precise[k] = r.precise;
       progress('位置合わせ中', ++done / (sorted.length - 1));
     }
   }
-  const crop = commonCrop(w, h, shifts);
-  const views = alignedViews(
-    sorted.map((e) => e.frame),
-    shifts,
-    crop,
-  );
 
-  // プレビュー用に縮小
-  const [pw, ph] = fitSize(crop.width, crop.height, previewSide);
-  const preview = views.map((v, k) => {
-    progress('プレビューを準備中', k / views.length);
-    return resizeView(v, pw, ph);
+  const p: Prepared = {
+    info: null as unknown as PreparedInfo,
+    entries: sorted,
+    refIndex,
+    width: w,
+    height: h,
+    aligned: align,
+    auto,
+    precise,
+    manual: sorted.map(() => ({ ...NO_MANUAL })),
+    transforms: auto,
+    crop: { x0: 0, y0: 0, width: w, height: h },
+    exposures: sorted.map(() => 1),
+    previewSide,
+    previewSrc: [],
+    preview: [],
+    layoutDirty: true,
+  };
+  updateTransforms(p);
+
+  // プレビュー用に縮小（ワープは縮小後に行う）
+  const crop = validCrop(w, h, p.transforms);
+  const [pw] = fitSize(crop.width, crop.height, previewSide);
+  const s = pw / crop.width;
+  const sw = Math.max(1, Math.round(w * s));
+  const sh = Math.max(1, Math.round(h * s));
+  p.previewSrc = sorted.map((e, k) => {
+    progress('プレビューを準備中', k / sorted.length);
+    return resizeView(fullView(e.frame), sw, sh);
   });
+  ensureLayout(p);
 
   // 露出比を推定（リニア値で）
-  const linLuts = preview.map((f) => linearLut(f.encoding));
+  const linLuts = p.preview.map((f) => linearLut(f.encoding));
   const fallback = exifEv.map((ev) => (ev === undefined ? NaN : Math.pow(2, ev)));
-  const order = sorted.map((_, i) => i);
-  const exposures = estimateExposures(preview.map(fullView), linLuts, order, refIndex, fallback);
+  p.exposures = estimateExposures(p.preview.map(fullView), linLuts, sorted.map((_, i) => i), refIndex, fallback);
+  p.info.relativeEv = Object.fromEntries(sorted.map((e, k) => [e.id, Math.log2(p.exposures[k])]));
+  return p;
+}
 
-  const info: PreparedInfo = {
-    order: sorted.map((e) => e.id),
-    referenceId: sorted[refIndex].id,
+/** 手動調整（内容をどれだけ動かすか）を自動の変換に合成する */
+function updateTransforms(p: Prepared): void {
+  const cx = (p.width - 1) / 2;
+  const cy = (p.height - 1) / 2;
+  p.transforms = p.auto.map((a, k) => {
+    const m = p.manual[k];
+    if (m.x === 0 && m.y === 0 && m.rotation === 0) return a;
+    const motion = rotationAbout((m.rotation * Math.PI) / 180, cx, cy, m.x, m.y);
+    return compose(a, invert(motion));
+  });
+}
+
+/** 切り抜き範囲とプレビュー用フレームを作り直す */
+function ensureLayout(p: Prepared): void {
+  if (!p.layoutDirty) return;
+  const crop = validCrop(p.width, p.height, p.transforms);
+  const [pw, ph] = fitSize(crop.width, crop.height, p.previewSide);
+  p.crop = crop;
+  p.preview = p.previewSrc.map((src, k) => warp(src, p.width, p.height, p.transforms[k], crop, pw, ph, false));
+  p.layoutDirty = false;
+  cache = null;
+  const cx = (p.width - 1) / 2;
+  const cy = (p.height - 1) / 2;
+  const alignment: Record<string, FrameAlignment> = {};
+  p.entries.forEach((e, k) => {
+    const [u, v] = apply(p.auto[k], cx, cy);
+    alignment[e.id] = {
+      auto: { dx: u - cx, dy: v - cy, rotation: angleDegrees(p.auto[k]), precise: p.precise[k] },
+      manual: { ...p.manual[k] },
+    };
+  });
+  p.info = {
+    order: p.entries.map((e) => e.id),
+    referenceId: p.entries[p.refIndex].id,
     width: crop.width,
     height: crop.height,
     previewWidth: pw,
     previewHeight: ph,
-    shifts: Object.fromEntries(sorted.map((e, k) => [e.id, shifts[k]])),
-    relativeEv: Object.fromEntries(sorted.map((e, k) => [e.id, Math.log2(exposures[k])])),
-    aligned: align,
+    alignment,
+    relativeEv: p.info?.relativeEv ?? {},
+    aligned: p.aligned,
   };
-  return { info, entries: sorted, refIndex, views, exposures, preview };
+}
+
+/** 基準フレームをそのまま表示した画像（比較用） */
+function referenceRGBA(p: Prepared): Uint8ClampedArray {
+  const ref = p.preview[p.refIndex];
+  const lut = displayLut(ref.encoding);
+  const disp = new Uint16Array(ref.data.length);
+  for (let i = 0; i < disp.length; i++) disp[i] = lut[ref.data[i]] * 65535 + 0.5;
+  const rgba = new Uint8ClampedArray(ref.width * ref.height * 4);
+  toRGBA8(disp, DEFAULT_ADJUSTMENTS, rgba);
+  return rgba;
+}
+
+/**
+ * 位置合わせ確認用のルーペ。フル解像度の等倍で、基準フレームと対象フレームを
+ * 明るさをそろえて重ねる（blend）か、差の大きさ（diff）を表示する。cx, cy は切り抜き範囲内の 0..1。
+ */
+function loupe(p: Prepared, id: string, cx: number, cy: number, size: number, mode: LoupeMode): Uint8ClampedArray {
+  const k = Math.max(0, p.entries.findIndex((e) => e.id === id));
+  const frames = [p.entries[p.refIndex].frame, p.entries[k].frame];
+  const ts = [p.transforms[p.refIndex], p.transforms[k]];
+  const luts = frames.map((f) => linearLut(f.encoding));
+  const gains = frames.map((f, i) => (f.encoding === 'linear' ? RAW_DISPLAY_GAIN : 1) / p.exposures[i === 0 ? p.refIndex : k]);
+  const X0 = p.crop.x0 + cx * (p.crop.width - 1) - size / 2 + 0.5;
+  const Y0 = p.crop.y0 + cy * (p.crop.height - 1) - size / 2 + 0.5;
+  const out = new Uint8ClampedArray(size * size * 4);
+  const px = new Float64Array(3);
+  const col = [new Float64Array(3), new Float64Array(3)];
+  for (let v = 0; v < size; v++) {
+    for (let u = 0; u < size; u++) {
+      for (let i = 0; i < 2; i++) {
+        const f = frames[i];
+        const [sx, sy] = apply(ts[i], X0 + u, Y0 + v);
+        sampleBilinear(f.data, f.width, f.height, f.width * 3, sx, sy, px);
+        for (let c = 0; c < 3; c++) col[i][c] = linearToDisplay(luts[i][Math.min(65535, px[c] | 0)] * gains[i]);
+      }
+      const o = (v * size + u) * 4;
+      for (let c = 0; c < 3; c++) {
+        out[o + c] = mode === 'blend' ? ((col[0][c] + col[1][c]) / 2) * 255 : Math.abs(col[0][c] - col[1][c]) * 3 * 255;
+      }
+      out[o + 3] = 255;
+    }
+  }
+  return out;
 }
 
 function baseKey(p: RenderParams): string {
@@ -280,18 +434,29 @@ async function exportImage(
   progress: (label: string, f: number) => void,
 ): Promise<{ blob: Blob; width: number; height: number }> {
   const p = requirePrepared();
-  const { width: cw, height: ch } = p.info;
-  let views = p.views;
-  if (opts.maxSide > 0 && Math.max(cw, ch) > opts.maxSide) {
-    const [tw, th] = fitSize(cw, ch, opts.maxSide);
-    views = views.map((v, k) => {
-      progress('縮小中', k / views.length);
-      return fullView(resizeView(v, tw, th));
-    });
-  }
+  ensureLayout(p);
+  const { crop, width: W, height: H } = p;
+  const scaled = opts.maxSide > 0 && Math.max(crop.width, crop.height) > opts.maxSide;
+  const [tw, th] = scaled ? fitSize(crop.width, crop.height, opts.maxSide) : [crop.width, crop.height];
+  // 位置合わせ済みのフレームを用意（整数の平行移動ならコピーせずにずらして参照する）
+  let views: View[] = p.entries.map((e, k) => {
+    progress('位置合わせを適用中', k / p.entries.length);
+    const t = p.transforms[k];
+    if (!scaled && isIntegerTranslation(t, 0.02, Math.max(W, H))) {
+      return { frame: e.frame, x0: crop.x0 + Math.round(t.tx), y0: crop.y0 + Math.round(t.ty), width: crop.width, height: crop.height };
+    }
+    const src = scaled
+      ? resizeView(fullView(e.frame), Math.max(1, Math.round((W * tw) / crop.width)), Math.max(1, Math.round((H * th) / crop.height)))
+      : e.frame;
+    return fullView(warp(src, W, H, t, crop, tw, th, true));
+  });
   const w = views[0].width;
   const h = views[0].height;
   let display: Uint16Array | null = renderBase(views, p, params, (f) => progress('書き出し用に合成中', f));
+  if (params.amount < 1) {
+    const ref = views[p.refIndex];
+    blendWithReference(display, ref, displayLut(ref.frame.encoding), params.amount);
+  }
   views = [];
   progress('ファイルを作成中', 1);
 

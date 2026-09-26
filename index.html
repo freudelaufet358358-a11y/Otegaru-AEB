@@ -45,10 +45,16 @@
             <canvas id="canvas-result"></canvas>
             <canvas id="canvas-before" hidden></canvas>
             <div class="compare-handle" id="compare-handle" hidden><span></span></div>
+            <div class="loupe-marker" id="loupe-marker" hidden></div>
             <div class="compare-labels" id="compare-labels" hidden>
               <span>合成前（基準）</span><span>合成後</span>
             </div>
           </div>
+        </div>
+
+        <div class="loupe-overlay" id="loupe-overlay" hidden>
+          <canvas id="loupe" width="160" height="160"></canvas>
+          <span class="loupe-label">等倍ルーペ</span>
         </div>
 
         <div class="busy" id="busy" hidden>
@@ -94,32 +100,76 @@
             </button>
           </div>
           <p class="hint" id="mode-hint"></p>
+          <label class="slider"><span>効果の強さ</span><input type="range" id="amount" min="0" max="100" value="100" /><output></output></label>
+
+          <div class="mode-params" data-for="fusion">
+            <label class="slider"><span>ディテール（立体感）</span><input type="range" id="fusion-detail" min="50" max="250" value="100" /><output></output></label>
+            <details>
+              <summary>詳細設定</summary>
+              <label class="slider"><span>細部を重視</span><input type="range" id="w-contrast" min="0" max="200" value="100" /><output></output></label>
+              <label class="slider"><span>色の鮮やかさを重視</span><input type="range" id="w-saturation" min="0" max="200" value="100" /><output></output></label>
+              <label class="slider"><span>適正露出を重視</span><input type="range" id="w-exposure" min="0" max="200" value="100" /><output></output></label>
+            </details>
+          </div>
+          <div class="mode-params" data-for="hdr" hidden>
+            <label class="slider"><span>明暗差の圧縮</span><input type="range" id="tone-strength" min="0" max="100" value="75" /><output></output></label>
+            <label class="slider"><span>ディテール（立体感）</span><input type="range" id="tone-detail" min="50" max="250" value="130" /><output></output></label>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2><span class="step">3</span>位置合わせ</h2>
           <label class="switch">
             <input type="checkbox" id="align" checked />
-            <span>自動位置合わせ（手持ち撮影向け）</span>
+            <span>自動位置合わせ（回転・細かいずれも補正）</span>
           </label>
-
-          <div class="mode-params" data-for="hdr" hidden>
-            <label class="slider"><span>圧縮の強さ</span><input type="range" id="tone-strength" min="0" max="100" value="75" /><output></output></label>
-            <label class="slider"><span>ディテール</span><input type="range" id="tone-detail" min="50" max="250" value="130" /><output></output></label>
-          </div>
-          <details class="mode-params" data-for="fusion">
-            <summary>詳細設定</summary>
-            <label class="slider"><span>細部を重視</span><input type="range" id="w-contrast" min="0" max="200" value="100" /><output></output></label>
-            <label class="slider"><span>色の鮮やかさを重視</span><input type="range" id="w-saturation" min="0" max="200" value="100" /><output></output></label>
-            <label class="slider"><span>適正露出を重視</span><input type="range" id="w-exposure" min="0" max="200" value="100" /><output></output></label>
+          <p class="hint" id="align-summary"></p>
+          <details id="manual-align">
+            <summary>手動で微調整する</summary>
+            <div class="manual">
+              <div class="frame-chips" id="frame-chips" role="radiogroup" aria-label="調整する写真"></div>
+              <div class="loupe-box">
+                <div class="segmented small" role="radiogroup" aria-label="ルーペの表示">
+                  <button type="button" role="radio" data-loupe="blend" aria-checked="true">重ねる</button>
+                  <button type="button" role="radio" data-loupe="diff" aria-checked="false">差分</button>
+                </div>
+              </div>
+              <p class="hint">
+                プレビュー右下のルーペに、タップした場所を等倍で表示します。輪郭が二重に見えなくなるように（差分なら全体が暗くなるように）動かしてください。
+              </p>
+              <div class="nudge-pad">
+                <button type="button" data-nudge="rotl" title="左に回転" aria-label="左に回転">⟲</button>
+                <button type="button" data-nudge="up" title="上へ" aria-label="上へ">↑</button>
+                <button type="button" data-nudge="rotr" title="右に回転" aria-label="右に回転">⟳</button>
+                <button type="button" data-nudge="left" title="左へ" aria-label="左へ">←</button>
+                <button type="button" data-nudge="reset" class="ghost" title="手動調整を戻す">戻す</button>
+                <button type="button" data-nudge="right" title="右へ" aria-label="右へ">→</button>
+                <span></span>
+                <button type="button" data-nudge="down" title="下へ" aria-label="下へ">↓</button>
+                <span></span>
+              </div>
+              <label class="field">
+                <span>1 回の移動量</span>
+                <select id="nudge-step">
+                  <option value="0.25">0.25px（細かく）</option>
+                  <option value="1" selected>1px</option>
+                  <option value="4">4px（大きく）</option>
+                </select>
+              </label>
+              <p class="hint" id="manual-readout"></p>
+            </div>
           </details>
         </section>
 
         <section class="card">
-          <h2><span class="step">3</span>仕上げ <button type="button" class="link-button small" id="reset-adjust">リセット</button></h2>
+          <h2><span class="step">4</span>仕上げ <button type="button" class="link-button small" id="reset-adjust">リセット</button></h2>
           <label class="slider"><span>明るさ</span><input type="range" id="adj-brightness" min="-100" max="100" value="0" /><output></output></label>
           <label class="slider"><span>コントラスト</span><input type="range" id="adj-contrast" min="-100" max="100" value="0" /><output></output></label>
           <label class="slider"><span>彩度</span><input type="range" id="adj-saturation" min="-100" max="100" value="0" /><output></output></label>
         </section>
 
         <section class="card">
-          <h2><span class="step">4</span>保存</h2>
+          <h2><span class="step">5</span>保存</h2>
           <div class="grid2">
             <label class="field">
               <span>形式</span>
@@ -153,6 +203,8 @@
           <li>カメラの AEB（オートブラケット）で、露出を変えて撮った写真を 2〜9 枚用意します。</li>
           <li>写真をまとめてドロップ（またはファイルを選択）すると、自動で位置合わせして合成します。</li>
           <li>「ナチュラル」は見た目に自然な露出フュージョン、「HDR」は暗部と明部をしっかり起こす HDR 調です。</li>
+          <li>「効果の強さ」で合成の効き具合を、「ディテール」で立体感を調整できます。</li>
+          <li>輪郭が二重に見えるときは「位置合わせ」→「手動で微調整する」で、ルーペを見ながら写真ごとに位置と傾きを直せます。</li>
           <li>「比較」で合成前と見比べ、仕上げを調整したら「画像を保存」。</li>
         </ol>
         <h3>EOS R6 Mark II で撮るときのコツ</h3>

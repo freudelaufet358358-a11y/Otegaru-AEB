@@ -1,6 +1,8 @@
 // 合成後の仕上げ調整（明るさ・コントラスト・彩度）と出力形式への変換。
 // 入力は表示用 (sRGB) の 16bit RGB インターリーブ配列。
 
+import { rowIndex, type View } from './frame';
+
 export interface Adjustments {
   /** -100..100。中間調を持ち上げる／下げる（白と黒は動かさない） */
   brightness: number;
@@ -74,4 +76,29 @@ export function toRGB16(src: Uint16Array, adj: Adjustments, out: Uint16Array): v
 function clamp16(v: number): number {
   const x = v * 65535 + 0.5;
   return x <= 0 ? 0 : x >= 65535 ? 65535 : x | 0;
+}
+
+/**
+ * 「効果の強さ」: 合成結果と基準フレーム（そのまま表示したもの）を amount (0..1) で混ぜる。
+ * out を省略すると merged を書き換える。
+ */
+export function blendWithReference(
+  merged: Uint16Array,
+  ref: View,
+  lut: Float32Array,
+  amount: number,
+  out: Uint16Array = merged,
+): Uint16Array {
+  const w = ref.width;
+  const d = ref.frame.data;
+  const k = Math.min(1, Math.max(0, amount));
+  for (let y = 0; y < ref.height; y++) {
+    let i = rowIndex(ref, y);
+    let o = y * w * 3;
+    for (let x = 0; x < w * 3; x++, i++, o++) {
+      const r = lut[d[i]] * 65535;
+      out[o] = r + (merged[o] - r) * k + 0.5;
+    }
+  }
+  return out;
 }

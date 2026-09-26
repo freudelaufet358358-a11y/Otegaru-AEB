@@ -25,9 +25,25 @@ export interface FusionWeights {
   saturation: number;
   /** 適正露出（中間調に近いほど高い）の重み指数 */
   exposure: number;
+  /** ディテール（局所コントラスト）の倍率。1 で標準 */
+  detail: number;
 }
 
-export const DEFAULT_FUSION_WEIGHTS: FusionWeights = { contrast: 1, saturation: 1, exposure: 1 };
+export const DEFAULT_FUSION_WEIGHTS: FusionWeights = { contrast: 1, saturation: 1, exposure: 1, detail: 1 };
+
+/**
+ * ディテール強調をかけるピラミッドの段。画像サイズに対する相対的な大きさで決めるので、
+ * プレビューと書き出しで見た目がそろう（長辺の 1/800 〜 1/24 程度の模様を強調）。
+ */
+export function detailLevels(w: number, h: number, levels: number): number[] {
+  const side = Math.max(w, h);
+  const out: number[] = [];
+  for (let l = 0; l < levels - 1; l++) {
+    const scale = 1 << l;
+    if (scale >= side / 800 && scale <= side / 24) out.push(l);
+  }
+  return out;
+}
 
 const SIGMA = 0.2;
 const EPS = 1e-12;
@@ -132,6 +148,7 @@ export function exposureFusion(
 
   // 3) チャンネルごとにラプラシアンピラミッドをブレンドして再構成
   const result = allocLevels(w, h, nl);
+  const boost = detailLevels(w, h, nl);
   for (let c = 0; c < 3; c++) {
     for (const lv of result) lv.data.fill(0);
     for (let k = 0; k < n; k++) {
@@ -140,6 +157,12 @@ export function exposureFusion(
       gaussianToLaplacian(work, tmp);
       accumulate(result, work, weightPyramids[k]);
       tick();
+    }
+    if (params.detail !== 1) {
+      for (const l of boost) {
+        const d = result[l].data;
+        for (let i = 0; i < d.length; i++) d[i] *= params.detail;
+      }
     }
     collapse(result, tmp);
     onChannel(c, result[0].data);

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { alignMTB, alignedViews, commonCrop, toGray8 } from '../src/core/align';
+import { alignFrames, alignMTB, fitSimilarity, toGray8 } from '../src/core/align';
+import { angleDegrees, apply, compose, invert, rotationAbout, validCrop, warp, IDENTITY } from '../src/core/transform';
 import { toRGBA8, toRGB16, DEFAULT_ADJUSTMENTS } from '../src/core/adjust';
 import { displayLut, linearLut, linearToDisplay, linearToSrgb, shoulder, srgbToLinear, fastLinearToSrgb } from '../src/core/color';
 import { exposureValue, formatShutter, readExif } from '../src/core/exif';
@@ -36,6 +37,49 @@ function shoot(s: Float32Array, w: number, h: number, e: number, dx = 0, dy = 0)
       for (let c = 0; c < 3; c++) {
         const v = s[(sy * w + sx) * 3 + c] * e;
         data[(y * w + x) * 3 + c] = Math.min(65535, Math.round(v * 65535));
+      }
+    }
+  }
+  return { width: w, height: h, data, encoding: 'linear' };
+}
+
+/** 位置合わせのテスト用: ランダムな長方形を重ねた、エッジの多いシーン */
+function texturedScene(w: number, h: number): Float32Array {
+  const s = new Float32Array(w * h * 3);
+  let seed = 7;
+  const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296);
+  const lum = new Float32Array(w * h).map((_, i) => 0.05 + 0.2 * ((i % w) / w));
+  for (let n = 0; n < 160; n++) {
+    const rw = 6 + rnd() * w * 0.15;
+    const rh = 6 + rnd() * h * 0.15;
+    const x0 = rnd() * (w - rw);
+    const y0 = rnd() * (h - rh);
+    const v = 0.02 + rnd() * 0.5;
+    for (let y = Math.floor(y0); y < y0 + rh; y++) for (let x = Math.floor(x0); x < x0 + rw; x++) lum[y * w + x] = v;
+  }
+  for (let i = 0; i < w * h; i++) {
+    s[i * 3] = lum[i] * 0.9;
+    s[i * 3 + 1] = lum[i];
+    s[i * 3 + 2] = lum[i] * 0.8;
+  }
+  return s;
+}
+
+/** 基準座標 → フレーム座標の変換 t で撮った（= フレーム上の q にはシーンの t⁻¹(q) が写る）フレーム */
+function shootWarped(s: Float32Array, w: number, h: number, e: number, t: typeof IDENTITY): Frame16 {
+  const inv = invert(t);
+  const data = new Uint16Array(w * h * 3);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const [sx, sy] = apply(inv, x, y);
+      const x0 = Math.min(w - 2, Math.max(0, Math.floor(sx)));
+      const y0 = Math.min(h - 2, Math.max(0, Math.floor(sy)));
+      const fx = Math.min(1, Math.max(0, sx - x0));
+      const fy = Math.min(1, Math.max(0, sy - y0));
+      for (let c = 0; c < 3; c++) {
+        const at = (xx: number, yy: number) => s[(yy * w + xx) * 3 + c];
+        const v = (at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx) * (1 - fy) + (at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx) * fy;
+        data[(y * w + x) * 3 + c] = Math.min(65535, Math.round(v * e * 65535));
       }
     }
   }
@@ -152,21 +196,71 @@ describe('align', () => {
       expect(shift).toEqual([dx, dy]);
     }
   });
-  it('共通領域の切り抜き', () => {
-    const crop = commonCrop(100, 80, [
-      [0, 0],
-      [5, -3],
-      [-2, 4],
-    ]);
-    expect(crop).toEqual({ x0: 2, y0: 3, width: 93, height: 73 });
-    const f: Frame16 = { width: 100, height: 80, data: new Uint16Array(100 * 80 * 3), encoding: 'linear' };
-    const views = alignedViews([f, f, f], [[0, 0], [5, -3], [-2, 4]], crop);
-    for (const v of views) {
-      expect(v.x0).toBeGreaterThanOrEqual(0);
-      expect(v.y0).toBeGreaterThanOrEqual(0);
-      expect(v.x0 + v.width).toBeLessThanOrEqual(100);
-      expect(v.y0 + v.height).toBeLessThanOrEqual(80);
+  it('回転と 1 画素未満のずれを検出できる（露出違い）', () => {
+    const w = 640;
+    const h = 480;
+    const s = texturedScene(w, h);
+    const lut = displayLut('linear');
+    const ref = shootWarped(s, w, h, 1, IDENTITY);
+    const truth = rotationAbout((0.4 * Math.PI) / 180, (w - 1) / 2, (h - 1) / 2, 5.3, -2.6);
+    const tgt = shootWarped(s, w, h, 4, truth);
+    const { transform, precise } = alignFrames(toGray8(ref, lut), toGray8(tgt, lut));
+    expect(precise).toBe(true);
+    expect(angleDegrees(transform)).toBeCloseTo(0.4, 1);
+    // 画像全体で 0.3px 以内
+    for (const [x, y] of [[0, 0], [w - 1, 0], [0, h - 1], [w - 1, h - 1], [w / 2, h / 2]]) {
+      const [u1, v1] = apply(transform, x, y);
+      const [u2, v2] = apply(truth, x, y);
+      expect(Math.hypot(u1 - u2, v1 - v2)).toBeLessThan(0.3);
     }
+  });
+  it('相似変換の当てはめ・合成・逆変換', () => {
+    const t = rotationAbout(0.1, 50, 40, 3, -2);
+    const pts = [[0, 0], [100, 0], [0, 80], [100, 80], [37, 12]].map(([x, y]) => {
+      const [u, v] = apply(t, x, y);
+      return { x, y, u, v };
+    });
+    const f = fitSimilarity(pts);
+    expect(f.a).toBeCloseTo(t.a, 9);
+    expect(f.b).toBeCloseTo(t.b, 9);
+    expect(f.tx).toBeCloseTo(t.tx, 9);
+    const id = compose(invert(t), t);
+    expect(id.a).toBeCloseTo(1, 12);
+    expect(id.b).toBeCloseTo(0, 12);
+    expect(id.tx).toBeCloseTo(0, 9);
+  });
+  it('共通領域の切り抜き（平行移動・回転）', () => {
+    const W = 100;
+    const H = 80;
+    // 整数の平行移動なら従来どおりの切り抜きになる
+    const crop = validCrop(W, H, [IDENTITY, { a: 1, b: 0, tx: 5, ty: -3 }, { a: 1, b: 0, tx: -2, ty: 4 }]);
+    expect(crop).toEqual({ x0: 2, y0: 3, width: 93, height: 73 });
+    // 回転があっても切り抜いた範囲の四隅はすべてのフレームの内側に入る
+    const ts = [IDENTITY, rotationAbout(0.02, 50, 40, 1.5, 0.5)];
+    const c = validCrop(W, H, ts);
+    for (const t of ts) {
+      for (const [x, y] of [[c.x0, c.y0], [c.x0 + c.width - 1, c.y0], [c.x0, c.y0 + c.height - 1], [c.x0 + c.width - 1, c.y0 + c.height - 1]]) {
+        const [u, v] = apply(t, x, y);
+        expect(u).toBeGreaterThanOrEqual(-1e-6);
+        expect(v).toBeGreaterThanOrEqual(-1e-6);
+        expect(u).toBeLessThanOrEqual(W - 1 + 1e-6);
+        expect(v).toBeLessThanOrEqual(H - 1 + 1e-6);
+      }
+    }
+    expect(c.width).toBeGreaterThan(80);
+  });
+  it('恒等変換のワープは元画像と一致する', () => {
+    const w = 31;
+    const h = 17;
+    const f = shoot(scene(w, h), w, h, 0.5);
+    const crop = { x0: 0, y0: 0, width: w, height: h };
+    for (const cubic of [false, true]) {
+      const out = warp(f, w, h, IDENTITY, crop, w, h, cubic);
+      expect(Array.from(out.data)).toEqual(Array.from(f.data));
+    }
+    // 整数の平行移動はずらしたものと一致する
+    const shifted = warp(f, w, h, { a: 1, b: 0, tx: 2, ty: 1 }, { x0: 0, y0: 0, width: w - 2, height: h - 1 }, w - 2, h - 1, true);
+    expect(shifted.data[0]).toBe(f.data[(1 * w + 2) * 3]);
   });
 });
 
@@ -349,5 +443,39 @@ describe('exif 書き出し', () => {
     expect(e.model).toBe('Canon EOS R6 Mark II');
     expect(e.dateTime).toBe('2024:01:02 03:04:05');
     expect(out[out.length - 1]).toBe(0xd9);
+  });
+});
+
+describe('効果の調整', () => {
+  it('ディテール強調はプレビューと書き出しで同じ相対スケールの段にかかる', async () => {
+    const { detailLevels } = await import('../src/core/fusion');
+    expect(detailLevels(1600, 1067, 11)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(detailLevels(5936, 3900, 12)).toEqual([3, 4, 5, 6, 7]);
+  });
+  it('ディテールを上げると局所コントラストが上がる', () => {
+    const w = 96;
+    const h = 64;
+    const frames = [0.25, 1, 4].map((e) => shoot(scene(w, h), w, h, e));
+    const lut = displayLut('linear');
+    const run = (detail: number) => {
+      const g = new Float32Array(w * h);
+      exposureFusion(frames.map(fullView), [lut, lut, lut], { ...DEFAULT_FUSION_WEIGHTS, detail }, (c, p) => {
+        if (c === 1) g.set(p);
+      });
+      let acc = 0;
+      for (let i = 1; i < g.length; i++) acc += Math.abs(g[i] - g[i - 1]);
+      return acc;
+    };
+    expect(run(1.8)).toBeGreaterThan(run(1) * 1.1);
+  });
+  it('効果の強さ 0 なら基準フレーム、1 なら合成結果', async () => {
+    const { blendWithReference } = await import('../src/core/adjust');
+    const f: Frame16 = { width: 2, height: 1, data: new Uint16Array([0, 1000, 65535, 30000, 40000, 50000]), encoding: 'srgb' };
+    const merged = new Uint16Array([100, 200, 300, 400, 500, 600]);
+    const lut = displayLut('srgb');
+    expect(Array.from(blendWithReference(merged, fullView(f), lut, 0, new Uint16Array(6)))).toEqual(Array.from(f.data));
+    expect(Array.from(blendWithReference(merged, fullView(f), lut, 1, new Uint16Array(6)))).toEqual(Array.from(merged));
+    const half = blendWithReference(merged, fullView(f), lut, 0.5, new Uint16Array(6));
+    expect(half[0]).toBe(50);
   });
 });

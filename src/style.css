@@ -33,7 +33,6 @@
 html,
 body {
   margin: 0;
-  height: 100%;
 }
 
 body {
@@ -177,9 +176,6 @@ select {
   .layout {
     grid-template-columns: 1fr;
   }
-  .stage {
-    min-height: 60vh;
-  }
   .panel {
     border-left: none;
     border-top: 1px solid var(--border);
@@ -267,8 +263,28 @@ body.dragging .stage {
   box-shadow: 0 6px 30px rgba(0, 0, 0, 0.5);
 }
 @media (max-width: 900px) {
+  /* スマートフォンではプレビューを画面上部に固定し、下の操作パネルだけをスクロールする */
+  .stage {
+    position: sticky;
+    top: 0;
+    z-index: 6;
+    min-height: 0;
+    height: 50vh;
+  }
+  .viewer {
+    padding: 0.5rem;
+  }
   .canvas-wrap canvas {
-    max-height: 58vh;
+    max-height: calc(50vh - 64px);
+  }
+  .dropzone {
+    margin: 0.75rem;
+    padding: 1rem;
+  }
+  .loupe-overlay {
+    width: 40%;
+    right: 8px;
+    bottom: 50px;
   }
 }
 #canvas-before {
@@ -340,6 +356,8 @@ body.dragging .stage {
   white-space: nowrap;
 }
 .chip {
+  flex-shrink: 0;
+  white-space: nowrap;
   border-radius: 99px;
   padding: 0.25em 0.9em;
   font-size: 0.85rem;
@@ -636,11 +654,118 @@ body.dragging .stage {
   color: var(--text-dim);
   align-self: center;
 }
-details.mode-params summary {
+details summary {
   cursor: pointer;
   color: var(--text-dim);
   font-size: 0.85rem;
   margin-bottom: 0.4rem;
+}
+details[open] > summary {
+  color: var(--text);
+}
+.mode-params details {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+/* 手動の位置調整 */
+.manual {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.frame-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+.frame-chips button {
+  border-radius: 99px;
+  padding: 0.2em 0.8em;
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+}
+.frame-chips button[aria-checked='true'] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #1a0f08;
+  font-weight: 700;
+}
+.frame-chips .adjusted::after {
+  content: ' ●';
+  font-size: 0.6em;
+  vertical-align: middle;
+}
+.loupe-box {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+/* 等倍ルーペ（プレビューの右下に重ねる） */
+.loupe-overlay {
+  position: absolute;
+  right: 14px;
+  bottom: 58px;
+  width: min(34%, 300px);
+  aspect-ratio: 1;
+  z-index: 4;
+  border: 2px solid #fff;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #000;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+}
+.loupe-overlay canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  image-rendering: pixelated;
+}
+.loupe-label {
+  position: absolute;
+  left: 6px;
+  top: 6px;
+  font-size: 0.7rem;
+  line-height: 1.4;
+  background: rgba(0, 0, 0, 0.6);
+  padding: 1px 7px;
+  border-radius: 99px;
+}
+.segmented.small {
+  padding: 2px;
+}
+.segmented.small button {
+  padding: 0.25em 0.3em;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+.nudge-pad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.35rem;
+  max-width: 240px;
+  align-self: center;
+  width: 100%;
+}
+.nudge-pad button {
+  font-size: 1.15rem;
+  padding: 0.35em 0;
+  touch-action: manipulation;
+}
+.nudge-pad button.ghost {
+  font-size: 0.8rem;
+}
+.loupe-marker {
+  position: absolute;
+  width: 26px;
+  height: 26px;
+  margin: -13px 0 0 -13px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
 }
 .mode-params {
   display: flex;

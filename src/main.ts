@@ -2,7 +2,7 @@ import './style.css';
 import { ensureCrossOriginIsolation } from './coi';
 import { readExif, formatShutter, type ExposureInfo } from './core/exif';
 import { isRawFile, makeThumbnail, RAW_ACCEPT, RawDecoder } from './raw';
-import type { ExportFormat, FromWorker, Mode, PreparedInfo, RenderParams, ToWorker } from './worker/protocol';
+import type { ExportFormat, FromWorker, LoupeMode, ManualAdjust, Mode, PreparedInfo, RenderParams, ToWorker } from './worker/protocol';
 
 /** プレビューの長辺 (px) */
 const PREVIEW_SIDE = 1600;
@@ -39,6 +39,14 @@ const el = {
   qualityRow: $('quality-row'),
   exportHint: $('export-hint'),
   help: $<HTMLDialogElement>('help'),
+  alignSummary: $('align-summary'),
+  manualAlign: $<HTMLDetailsElement>('manual-align'),
+  frameChips: $('frame-chips'),
+  loupe: $<HTMLCanvasElement>('loupe'),
+  loupeMarker: $('loupe-marker'),
+  loupeOverlay: $('loupe-overlay'),
+  nudgeStep: $<HTMLSelectElement>('nudge-step'),
+  manualReadout: $('manual-readout'),
 };
 
 const MODE_HINTS: Record<Mode, string> = {
@@ -310,6 +318,7 @@ function loadingItems(): Item[] {
 function onItemsChanged(): void {
   generation++;
   prepared = null;
+  updateAlignmentUI();
   const all = [...items.values()];
   el.fileCount.textContent = all.length ? `${all.length} 枚` : '';
   for (const item of all) renderItem(item);
@@ -367,9 +376,9 @@ async function runProcess(): Promise<void> {
       (label, f) => showBusy(label, f),
     );
     if (gen !== generation) return;
-    prepared = res.info;
-    drawRGBA(el.before, res.reference, res.info.previewWidth, res.info.previewHeight);
-    if (maxShift(res.info) > Math.max(res.info.width, res.info.height) * 0.015) {
+    manualState.clear();
+    applyLayout(res.info, res.reference);
+    if (alignmentStats(res.info).shift > Math.max(res.info.width, res.info.height) * 0.015) {
       toast('位置のずれが大きい画像があります。同じ構図で撮ったブラケット写真か確認してください');
     }
     // 暗い→明るい順に並べ替える
@@ -424,22 +433,38 @@ async function renderOnce(gen: number, showProgress: boolean): Promise<void> {
       showProgress ? (label, f) => showBusy(label + '…', f) : undefined,
     );
     if (gen !== generation || !prepared) return;
+    if (res.layout) applyLayout(res.layout.info, res.layout.reference);
     drawRGBA(el.result, res.rgba, res.width, res.height);
     showViewer(true);
-    const shift = maxShift(prepared);
+    const { shift, rotation } = alignmentStats(prepared);
     el.info.textContent = [
       `${prepared.width}×${prepared.height}`,
       `${prepared.order.length}枚`,
       params.mode === 'fusion' ? 'ナチュラル' : 'HDR',
-      prepared.aligned ? (shift ? `ずれ補正 最大${shift}px` : 'ずれなし') : '位置合わせオフ',
+      !prepared.aligned ? '位置合わせオフ' : shift < 0.05 && rotation < 0.005 ? 'ずれなし' : `位置補正 ${shift.toFixed(1)}px・${rotation.toFixed(2)}°`,
     ].join(' · ');
   } catch (e) {
     if (gen === generation) toast(errorMessage(e), true);
   }
 }
 
-function maxShift(info: PreparedInfo): number {
-  return Math.max(0, ...Object.values(info.shifts).map(([x, y]) => Math.max(Math.abs(x), Math.abs(y))));
+/** 準備結果（切り抜き範囲・位置合わせ）を反映する */
+function applyLayout(info: PreparedInfo, reference: Uint8ClampedArray): void {
+  prepared = info;
+  drawRGBA(el.before, reference, info.previewWidth, info.previewHeight);
+  updateAlignmentUI();
+}
+
+/** 自動位置合わせで補正した最大の移動量 [px] と回転 [度] */
+function alignmentStats(info: PreparedInfo): { shift: number; rotation: number; partial: boolean } {
+  const autos = Object.entries(info.alignment)
+    .filter(([id]) => id !== info.referenceId)
+    .map(([, a]) => a.auto);
+  return {
+    shift: Math.max(0, ...autos.map((a) => Math.hypot(a.dx, a.dy))),
+    rotation: Math.max(0, ...autos.map((a) => Math.abs(a.rotation))),
+    partial: autos.some((a) => !a.precise),
+  };
 }
 
 function drawRGBA(canvas: HTMLCanvasElement, rgba: Uint8ClampedArray, w: number, h: number): void {
@@ -452,6 +477,7 @@ function showViewer(on: boolean): void {
   el.viewer.hidden = !on;
   el.toolbar.hidden = !on;
   if (on) el.dropzone.hidden = true;
+  updateLoupeMarker();
 }
 
 function showBusy(label: string, fraction: number): void {
@@ -470,6 +496,8 @@ function hideBusy(): void {
 let mode: Mode = 'fusion';
 
 const sliders = {
+  amount: $<HTMLInputElement>('amount'),
+  fusionDetail: $<HTMLInputElement>('fusion-detail'),
   toneStrength: $<HTMLInputElement>('tone-strength'),
   toneDetail: $<HTMLInputElement>('tone-detail'),
   wContrast: $<HTMLInputElement>('w-contrast'),
@@ -482,6 +510,8 @@ const sliders = {
 };
 
 const formats: Partial<Record<keyof typeof sliders, (v: number) => string>> = {
+  amount: (v) => `${v}%`,
+  fusionDetail: (v) => `${(v / 100).toFixed(2)}×`,
   toneDetail: (v) => `${(v / 100).toFixed(2)}×`,
   wContrast: (v) => (v / 100).toFixed(2),
   wSaturation: (v) => (v / 100).toFixed(2),
@@ -498,10 +528,12 @@ function num(input: HTMLInputElement): number {
 function currentParams(): RenderParams {
   return {
     mode,
+    amount: num(sliders.amount) / 100,
     fusion: {
       contrast: num(sliders.wContrast) / 100,
       saturation: num(sliders.wSaturation) / 100,
       exposure: num(sliders.wExposure) / 100,
+      detail: num(sliders.fusionDetail) / 100,
     },
     tone: { strength: num(sliders.toneStrength) / 100, detail: num(sliders.toneDetail) / 100 },
     adjust: {
@@ -553,6 +585,164 @@ function onComparePointer(ev: PointerEvent): void {
   const r = el.result.getBoundingClientRect();
   comparePos = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width));
   updateCompare();
+}
+
+// ---------------------------------------------------------------------------
+// 位置の手動調整
+
+const LOUPE_SIZE = 160;
+let selectedFrame: string | null = null;
+/** 手動調整の値（ワーカーからの返信で古い値に戻らないよう、画面側を正とする） */
+const manualState = new Map<string, ManualAdjust>();
+let loupePos = { x: 0.5, y: 0.5 };
+let loupeMode: LoupeMode = 'blend';
+
+function adjustableIds(): string[] {
+  const info = prepared;
+  return info ? info.order.filter((id) => id !== info.referenceId) : [];
+}
+
+function updateAlignmentUI(): void {
+  const info = prepared;
+  if (!info) {
+    el.alignSummary.textContent = '';
+    el.frameChips.replaceChildren();
+    el.manualReadout.textContent = '';
+    updateLoupeMarker();
+    return;
+  }
+  const { shift, rotation, partial } = alignmentStats(info);
+  el.alignSummary.textContent = !info.aligned
+    ? '自動位置合わせはオフです（手動での調整はできます）'
+    : shift < 0.05 && rotation < 0.005
+      ? 'ずれは見つかりませんでした'
+      : `ずれを補正しました（最大 ${shift.toFixed(1)}px・回転 ${rotation.toFixed(2)}°）${partial ? '。一部の写真は平行移動のみ補正しています' : ''}`;
+
+  const ids = adjustableIds();
+  if (!selectedFrame || !ids.includes(selectedFrame)) selectedFrame = ids[0] ?? null;
+  el.frameChips.replaceChildren(
+    ...ids.map((id) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.setAttribute('role', 'radio');
+      b.setAttribute('aria-checked', String(id === selectedFrame));
+      const ev = info.relativeEv[id];
+      b.textContent = ev !== undefined ? formatEv(ev) : (items.get(id)?.file.name ?? id);
+      b.title = items.get(id)?.file.name ?? '';
+      const m = manualOf(id);
+      if (m.x || m.y || m.rotation) b.classList.add('adjusted');
+      b.onclick = () => {
+        selectedFrame = id;
+        updateAlignmentUI();
+        requestLoupe();
+      };
+      return b;
+    }),
+  );
+  const a = selectedFrame ? info.alignment[selectedFrame] : undefined;
+  const m = selectedFrame ? manualOf(selectedFrame) : undefined;
+  const sign = (v: number, digits: number) => `${v >= 0 ? '+' : '−'}${Math.abs(v).toFixed(digits)}`;
+  el.manualReadout.textContent =
+    a && m
+      ? `自動: 横 ${sign(a.auto.dx, 1)}px 縦 ${sign(a.auto.dy, 1)}px 回転 ${sign(a.auto.rotation, 2)}° ／ ` +
+        `手動: 横 ${sign(m.x, 2)}px 縦 ${sign(m.y, 2)}px 回転 ${sign(m.rotation, 3)}°`
+      : '';
+  updateLoupeMarker();
+}
+
+function manualOf(id: string): ManualAdjust {
+  return manualState.get(id) ?? { x: 0, y: 0, rotation: 0 };
+}
+
+function nudge(action: string): void {
+  if (!prepared || !selectedFrame) return;
+  const step = Number(el.nudgeStep.value);
+  const m: ManualAdjust = { ...manualOf(selectedFrame) };
+  switch (action) {
+    case 'left':
+      m.x -= step;
+      break;
+    case 'right':
+      m.x += step;
+      break;
+    case 'up':
+      m.y -= step;
+      break;
+    case 'down':
+      m.y += step;
+      break;
+    case 'rotl':
+      m.rotation -= step * 0.05;
+      break;
+    case 'rotr':
+      m.rotation += step * 0.05;
+      break;
+    case 'reset':
+      m.x = m.y = m.rotation = 0;
+      break;
+    default:
+      return;
+  }
+  const round = (v: number) => Math.round(v * 10000) / 10000;
+  m.x = round(m.x);
+  m.y = round(m.y);
+  m.rotation = round(m.rotation);
+  manualState.set(selectedFrame, m);
+  send({ type: 'setManual', id: selectedFrame, manual: m });
+  updateAlignmentUI();
+  requestLoupe();
+  requestRender();
+}
+
+let loupeInFlight = false;
+let loupeWanted = false;
+
+function requestLoupe(): void {
+  if (!prepared || !selectedFrame || !el.manualAlign.open) return;
+  loupeWanted = true;
+  if (!loupeInFlight) void loupeLoop();
+}
+
+async function loupeLoop(): Promise<void> {
+  loupeInFlight = true;
+  while (loupeWanted && prepared && selectedFrame) {
+    loupeWanted = false;
+    const gen = generation;
+    const id = selectedFrame;
+    try {
+      const res = await request<'loupe'>((reqId) => ({
+        type: 'loupe',
+        reqId,
+        id,
+        cx: loupePos.x,
+        cy: loupePos.y,
+        size: LOUPE_SIZE,
+        mode: loupeMode,
+      }));
+      if (gen === generation) drawRGBA(el.loupe, res.rgba, res.size, res.size);
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+  loupeInFlight = false;
+}
+
+function updateLoupeMarker(): void {
+  const on = !!(prepared && el.manualAlign.open && selectedFrame && !el.viewer.hidden);
+  el.loupeMarker.hidden = !on;
+  el.loupeOverlay.hidden = !on;
+  el.loupeMarker.style.left = `${loupePos.x * 100}%`;
+  el.loupeMarker.style.top = `${loupePos.y * 100}%`;
+}
+
+function setLoupeFromPointer(ev: PointerEvent): void {
+  const r = el.result.getBoundingClientRect();
+  loupePos = {
+    x: Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)),
+    y: Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height)),
+  };
+  updateLoupeMarker();
+  requestLoupe();
 }
 
 // ---------------------------------------------------------------------------
@@ -699,16 +889,57 @@ function bindEvents(): void {
   };
 
   el.compare.onclick = () => setCompare(el.compare.getAttribute('aria-pressed') !== 'true');
-  let dragging = false;
+  // プレビュー上のドラッグ: 比較中は境界線、手動調整中はルーペの位置
+  let dragging: 'compare' | 'loupe' | null = null;
   el.canvasWrap.addEventListener('pointerdown', (e) => {
-    if (el.before.hidden) return;
-    dragging = true;
+    if (!el.before.hidden) dragging = 'compare';
+    else if (el.manualAlign.open && prepared) dragging = 'loupe';
+    else return;
     el.canvasWrap.setPointerCapture(e.pointerId);
-    onComparePointer(e);
+    if (dragging === 'compare') onComparePointer(e);
+    else setLoupeFromPointer(e);
   });
-  el.canvasWrap.addEventListener('pointermove', (e) => dragging && onComparePointer(e));
-  el.canvasWrap.addEventListener('pointerup', () => (dragging = false));
-  el.canvasWrap.addEventListener('pointercancel', () => (dragging = false));
+  el.canvasWrap.addEventListener('pointermove', (e) => {
+    if (dragging === 'compare') onComparePointer(e);
+    else if (dragging === 'loupe') setLoupeFromPointer(e);
+  });
+  el.canvasWrap.addEventListener('pointerup', () => (dragging = null));
+  el.canvasWrap.addEventListener('pointercancel', () => (dragging = null));
+
+  el.manualAlign.addEventListener('toggle', () => {
+    updateLoupeMarker();
+    requestLoupe();
+  });
+  for (const b of document.querySelectorAll<HTMLButtonElement>('[data-nudge]')) {
+    b.onclick = () => nudge(b.dataset.nudge!);
+  }
+  for (const b of document.querySelectorAll<HTMLButtonElement>('[data-loupe]')) {
+    b.onclick = () => {
+      loupeMode = b.dataset.loupe as LoupeMode;
+      for (const o of document.querySelectorAll<HTMLButtonElement>('[data-loupe]')) {
+        o.setAttribute('aria-checked', String(o === b));
+      }
+      requestLoupe();
+    };
+  }
+  // 手動調整中はキーボードでも動かせる（矢印キーで移動、[ ] で回転）
+  window.addEventListener('keydown', (e) => {
+    if (!el.manualAlign.open || !prepared) return;
+    const target = e.target as HTMLElement;
+    if (target.closest('input, select, textarea')) return;
+    const map: Record<string, string> = {
+      ArrowLeft: 'left',
+      ArrowRight: 'right',
+      ArrowUp: 'up',
+      ArrowDown: 'down',
+      '[': 'rotl',
+      ']': 'rotr',
+    };
+    const action = map[e.key];
+    if (!action) return;
+    e.preventDefault();
+    nudge(action);
+  });
 
   el.exportFormat.onchange = updateExportState;
   el.exportBtn.onclick = () => void doExport();
