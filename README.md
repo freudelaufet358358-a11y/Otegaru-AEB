@@ -4,6 +4,8 @@
 **Canon EOS R6 Mark II の CR3 RAW**（通常 RAW / C-RAW）をそのまま読み込めます。
 画像はすべて端末内（WebAssembly / Web Worker）で処理され、サーバーには送信されません。
 
+**▶ 公開ページ: https://freudelaufet358358-a11y.github.io/Otegaru-AEB/**
+
 ## できること
 
 - 写真をまとめてドロップするだけで、並べ替え → 位置合わせ → 合成まで自動
