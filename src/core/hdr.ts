@@ -9,6 +9,9 @@ import type { ProgressFn } from './fusion';
 
 const CLIP_START = 0.8;
 const CLIP_END = 0.96;
+/** 最も暗いフレームでもこの明るさを超えた画素は、白に向けて彩度を落とす（下の mergeRow を参照） */
+const DESAT_START = 0.94;
+const DESAT_END = 0.99;
 
 /** 白飛び付近を滑らかに除外する重み */
 function clipWeight(m: number): number {
@@ -116,6 +119,10 @@ export function mergeRow(
       sw += cw * exposures[k];
     }
     const o = off;
+    const j = starts[darkest] + off;
+    const dr = lk[dk[j]];
+    const dg = lk[dk[j + 1]];
+    const db = lk[dk[j + 2]];
     if (sw > 0) {
       const inv = 1 / sw;
       out[o] = sr * inv;
@@ -123,10 +130,23 @@ export function mergeRow(
       out[o + 2] = sb * inv;
     } else {
       // 最も暗いフレームでも白飛びしている → そのまま使う
-      const i = starts[darkest] + off;
-      out[o] = lk[dk[i]] * invDark;
-      out[o + 1] = lk[dk[i + 1]] * invDark;
-      out[o + 2] = lk[dk[i + 2]] * invDark;
+      out[o] = dr * invDark;
+      out[o + 1] = dg * invDark;
+      out[o + 2] = db * invDark;
+    }
+    // 最も暗いフレームでも飽和しかけている画素は、一部の色だけが頭打ちになって色相が狂っている
+    // （太陽や窓が紫・ピンクに見える）。トーンマッピングで暗く引き下げると目立つので、白に向けて彩度を落とす
+    const md = dr > dg ? (dr > db ? dr : db) : dg > db ? dg : db;
+    if (md > DESAT_START) {
+      let t = md >= DESAT_END ? 1 : (md - DESAT_START) / (DESAT_END - DESAT_START);
+      t = t * t * (3 - 2 * t);
+      const r = out[o];
+      const g = out[o + 1];
+      const b = out[o + 2];
+      const M = r > g ? (r > b ? r : b) : g > b ? g : b;
+      out[o] = r + (M - r) * t;
+      out[o + 1] = g + (M - g) * t;
+      out[o + 2] = b + (M - b) * t;
     }
   }
 }

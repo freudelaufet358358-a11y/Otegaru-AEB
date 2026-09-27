@@ -291,6 +291,23 @@ describe('hdr', () => {
       expect(Math.abs(row[x * 3 + 1] - truth) / truth).toBeLessThan(0.02);
     }
   });
+  it('最も暗いフレームでも飽和した画素は白に向けて彩度を落とし、飽和していない色は保つ', () => {
+    // 1 画素目: 全フレームで G だけ頭打ちになった明るい画素（そのままだとマゼンタに寄る）
+    // 2 画素目: 最も暗いフレームでは飽和していない鮮やかな色
+    const px = (e: number): Frame16 => {
+      const v = [1.0, 0.8, 1.0, 0.1, 0.3, 0.6].map((c, i) => (i < 3 ? Math.min(1, 4 * e * c) : Math.min(1, e * c)));
+      return { width: 2, height: 1, data: new Uint16Array(v.map((c) => Math.round(c * 65535))), encoding: 'linear' };
+    };
+    const exps = [0.25, 1, 4];
+    const views = exps.map((e) => fullView(px(e)));
+    const lut = linearLut('linear');
+    const row = new Float32Array(6);
+    mergeRow(views, [lut, lut, lut], exps, 0, 0, row);
+    expect(row[0]).toBeCloseTo(row[1], 5);
+    expect(row[1]).toBeCloseTo(row[2], 5);
+    expect(row[3] / row[5]).toBeCloseTo(0.1 / 0.6, 2);
+    expect(row[4] / row[5]).toBeCloseTo(0.3 / 0.6, 2);
+  });
   it('トーンマッピングの出力が 16bit の範囲に収まり、暗部が持ち上がる', () => {
     const w = 160;
     const h = 90;
