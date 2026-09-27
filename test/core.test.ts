@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { alignFrames, alignMTB, fitSimilarity, toGray8 } from '../src/core/align';
 import { angleDegrees, apply, compose, invert, rotationAbout, validCrop, warp, IDENTITY } from '../src/core/transform';
 import { toRGBA8, toRGB16, DEFAULT_ADJUSTMENTS } from '../src/core/adjust';
-import { displayLut, linearLut, linearToDisplay, linearToSrgb, shoulder, srgbToLinear, fastLinearToSrgb } from '../src/core/color';
+import { displayLut, linearLut, linearToDisplay, linearToSrgb, shoulder, srgbToLinear, fastLinearToSrgb, toDisplay16 } from '../src/core/color';
 import { exposureValue, formatShutter, readExif } from '../src/core/exif';
 import { fullView, resizeView, type Frame16 } from '../src/core/frame';
 import { exposureFusion, DEFAULT_FUSION_WEIGHTS } from '../src/core/fusion';
@@ -103,6 +103,23 @@ describe('color', () => {
     for (let i = 1; i < 65536; i++) expect(lut[i]).toBeGreaterThanOrEqual(lut[i - 1]);
     expect(lut[0]).toBe(0);
     expect(lut[65535]).toBeLessThanOrEqual(1);
+  });
+  it('表示用の 16bit: RAW は素の表示に変換し、JPEG などはそのまま（元の配列は書き換えない）', () => {
+    const data = Uint16Array.from([0, 1, 100, 5000, 20000, 46341, 65535, 12345, 777]);
+    const copy = data.slice();
+    const lut = displayLut('linear');
+    const raw = toDisplay16(data, 'linear');
+    expect(raw).not.toBe(data);
+    expect(Array.from(data)).toEqual(Array.from(copy));
+    for (let i = 0; i < data.length; i++) expect(raw[i]).toBe(Math.floor(lut[data[i]] * 65535 + 0.5));
+    const photo = toDisplay16(data, 'srgb');
+    expect(photo).not.toBe(data);
+    expect(Array.from(photo)).toEqual(Array.from(data));
+    // out に元の配列を渡すと、その場で変換する
+    const inPlace = data.slice();
+    expect(toDisplay16(inPlace, 'linear', inPlace)).toBe(inPlace);
+    expect(Array.from(inPlace)).toEqual(Array.from(raw));
+    expect(toDisplay16(inPlace, 'srgb', inPlace)).toBe(inPlace);
   });
 });
 

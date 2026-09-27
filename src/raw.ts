@@ -146,6 +146,31 @@ export class RawDecoder {
   }
 }
 
+let rawChain: Promise<void> = Promise.resolve();
+let rawWaiting = 0;
+let sharedDecoder: RawDecoder | null = null;
+
+/**
+ * RAW を扱う処理を 1 つずつ順番に行う（LibRaw は一度に 1 枚しか開けないので、どのタブからもこれを通す）。
+ * 待っている処理がなくなったら、WASM のメモリを解放するためにデコーダを破棄する。
+ */
+export function withRawDecoder<T>(task: (decoder: RawDecoder) => Promise<T>): Promise<T> {
+  rawWaiting++;
+  const run = rawChain.then(() => task((sharedDecoder ??= new RawDecoder())));
+  rawChain = run
+    .then(
+      () => undefined,
+      () => undefined,
+    )
+    .finally(() => {
+      if (--rawWaiting === 0) {
+        sharedDecoder?.dispose();
+        sharedDecoder = null;
+      }
+    });
+  return run;
+}
+
 /** 撮影時のホワイトバランスの倍率の逆数（カメラのニュートラル）と、XYZ → カメラ RGB の色行列 */
 function rawColor(m: LibRawMetadata): RawColor | undefined {
   const mul = m.color_data?.cam_mul;

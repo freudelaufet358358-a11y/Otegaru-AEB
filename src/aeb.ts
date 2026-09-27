@@ -1,31 +1,40 @@
-import './style.css';
-import { ensureCrossOriginIsolation } from './coi';
-import { readExif, formatShutter, type ExposureInfo } from './core/exif';
+// 「AEB 合成」タブ: 露出違いの写真を読み込み、位置合わせ・合成・仕上げ・保存を行う。
+// 合成結果は「Leica M10 の色」タブに送って、色を仕上げることもできる。
+
+import { readExif, type ExposureInfo } from './core/exif';
 import { DEFAULT_FUSION_WEIGHTS } from './core/fusion';
-import type { LookId } from './core/look';
-import { isRawFile, makeThumbnail, RAW_ACCEPT, RawDecoder } from './raw';
+import type { MergedHandoff } from './leica';
+import { isRawFile, makeThumbnail, withRawDecoder, type RawDecoder } from './raw';
+import {
+  $,
+  baseName,
+  bindSliders,
+  BusyOverlay,
+  CompareView,
+  download,
+  drawRGBA,
+  errorMessage,
+  exposureText,
+  FILE_ACCEPT,
+  fillFileRow,
+  formatBytes,
+  formatEv,
+  isImageFile,
+  toast,
+  WorkerClient,
+} from './ui';
 import type { ExportFormat, FromWorker, LoupeMode, ManualAdjust, Mode, PreparedInfo, RenderParams, ToWorker } from './worker/protocol';
 
 /** プレビューの長辺 (px) */
 const PREVIEW_SIDE = 1600;
 
-const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
-
 const el = {
-  banner: $('banner'),
-  stage: $('stage'),
   dropzone: $('dropzone'),
   viewer: $('viewer'),
   canvasWrap: $('canvas-wrap'),
   result: $<HTMLCanvasElement>('canvas-result'),
   before: $<HTMLCanvasElement>('canvas-before'),
-  handle: $('compare-handle'),
-  labels: $('compare-labels'),
-  busy: $('busy'),
-  busyLabel: $('busy-label'),
-  busyBar: $('busy-bar'),
   toolbar: $('stage-toolbar'),
-  compare: $<HTMLButtonElement>('toggle-compare'),
   info: $('stage-info'),
   miniSpinner: $('mini-spinner'),
   fileList: $<HTMLUListElement>('file-list'),
@@ -40,7 +49,7 @@ const el = {
   exportQuality: $<HTMLInputElement>('export-quality'),
   qualityRow: $('quality-row'),
   exportHint: $('export-hint'),
-  help: $<HTMLDialogElement>('help'),
+  toLeica: $<HTMLButtonElement>('to-leica'),
   alignSummary: $('align-summary'),
   manualAlign: $<HTMLDetailsElement>('manual-align'),
   frameChips: $('frame-chips'),
@@ -49,10 +58,26 @@ const el = {
   loupeOverlay: $('loupe-overlay'),
   nudgeStep: $<HTMLSelectElement>('nudge-step'),
   manualReadout: $('manual-readout'),
-  lookParams: $('look-params'),
-  lookHint: $('look-hint'),
-  lookTone: $<HTMLInputElement>('look-tone'),
 };
+
+const busy = new BusyOverlay($('busy'));
+const compare = new CompareView({
+  toggle: $<HTMLButtonElement>('toggle-compare'),
+  result: el.result,
+  before: el.before,
+  handle: $('compare-handle'),
+  labels: $('compare-labels'),
+});
+
+/** 画面全体（main.ts）とのつなぎ */
+export interface AebHooks {
+  /** このタブが表示されているか（キー操作を受け付けるかどうか） */
+  isActive: () => boolean;
+  /** 合成結果を「Leica M10 の色」タブで開く */
+  openInLeica: (job: MergedHandoff) => void;
+}
+
+let hooks: AebHooks = { isActive: () => true, openInLeica: () => {} };
 
 const MODE_HINTS: Record<Mode, string> = {
   learned:
@@ -63,68 +88,25 @@ const MODE_HINTS: Record<Mode, string> = {
 
 const MODE_NAMES: Record<Mode, string> = { learned: 'おまかせ', fusion: 'ナチュラル', hdr: 'HDR' };
 
-const LOOK_NAMES: Record<LookId, string> = { none: '', 'leica-m10': 'Leica M10' };
-
 // ---------------------------------------------------------------------------
 // 合成ワーカーとの通信
 
 const worker = new Worker(new URL('./worker/process.worker.ts', import.meta.url), { type: 'module' });
-
-type Pending = {
-  resolve: (m: FromWorker) => void;
-  reject: (e: Error) => void;
-  onProgress?: (label: string, fraction: number) => void;
-};
-let reqSeq = 0;
-const pending = new Map<number, Pending>();
 const addWaiters = new Map<string, { resolve: (m: Extract<FromWorker, { type: 'added' }>) => void; reject: (e: Error) => void }>();
 
-worker.onmessage = (ev: MessageEvent<FromWorker>) => {
-  const m = ev.data;
-  switch (m.type) {
-    case 'added': {
-      addWaiters.get(m.id)?.resolve(m);
-      addWaiters.delete(m.id);
-      break;
-    }
-    case 'addFailed': {
-      addWaiters.get(m.id)?.reject(new Error(m.message));
-      addWaiters.delete(m.id);
-      break;
-    }
-    case 'progress':
-      pending.get(m.reqId)?.onProgress?.(m.label, m.fraction);
-      break;
-    case 'error': {
-      pending.get(m.reqId)?.reject(new Error(m.message));
-      pending.delete(m.reqId);
-      break;
-    }
-    default: {
-      pending.get(m.reqId)?.resolve(m);
-      pending.delete(m.reqId);
-    }
-  }
-};
+const client = new WorkerClient<ToWorker, FromWorker>(worker, (m) => {
+  if (m.type === 'added') addWaiters.get(m.id)?.resolve(m);
+  else if (m.type === 'addFailed') addWaiters.get(m.id)?.reject(new Error(m.message));
+  else return;
+  addWaiters.delete(m.id);
+});
 worker.onerror = (e) => {
   console.error(e);
   toast('処理中に問題が発生しました。メモリ不足の可能性があります（RAW を 1/2 サイズにすると軽くなります）', true);
 };
 
-function send(msg: ToWorker, transfer: Transferable[] = []): void {
-  worker.postMessage(msg, transfer);
-}
-
-function request<T extends FromWorker['type']>(
-  build: (reqId: number) => ToWorker,
-  onProgress?: (label: string, fraction: number) => void,
-): Promise<Extract<FromWorker, { type: T }>> {
-  const reqId = ++reqSeq;
-  return new Promise((resolve, reject) => {
-    pending.set(reqId, { resolve: resolve as (m: FromWorker) => void, reject, onProgress });
-    send(build(reqId));
-  });
-}
+const send = (msg: ToWorker, transfer: Transferable[] = []) => client.post(msg, transfer);
+const request = client.request.bind(client);
 
 function addToWorker(msg: ToWorker & { id: string }, transfer: Transferable[] = []) {
   return new Promise<Extract<FromWorker, { type: 'added' }>>((resolve, reject) => {
@@ -156,10 +138,8 @@ let idSeq = 0;
 let generation = 0;
 let prepared: PreparedInfo | null = null;
 
-const IMAGE_EXT = /\.(jpe?g|png|webp|avif|gif|bmp|tiff?|heic|heif|jxl)$/i;
-
 function addFiles(files: File[]): void {
-  const accepted = files.filter((f) => isRawFile(f) || f.type.startsWith('image/') || IMAGE_EXT.test(f.name));
+  const accepted = files.filter(isImageFile);
   const skipped = files.length - accepted.length;
   if (skipped > 0) toast(`${skipped} 件のファイルは画像ではないため読み込みませんでした`);
   for (const file of accepted) {
@@ -181,30 +161,16 @@ function addFiles(files: File[]): void {
   if (accepted.length) onItemsChanged();
 }
 
-let rawChain: Promise<void> = Promise.resolve();
-let rawQueued = 0;
-let decoder: RawDecoder | null = null;
-
 function queueRaw(item: Item): void {
-  rawQueued++;
   const version = ++item.version;
-  rawChain = rawChain
-    .then(() => loadRaw(item, version))
-    .finally(() => {
-      if (--rawQueued === 0) {
-        // WASM のメモリを解放する
-        decoder?.dispose();
-        decoder = null;
-      }
-    });
+  void withRawDecoder((decoder) => loadRaw(item, version, decoder));
 }
 
-async function loadRaw(item: Item, version: number): Promise<void> {
+async function loadRaw(item: Item, version: number, decoder: RawDecoder): Promise<void> {
   // 削除された、または読み込み直しが予約された場合は結果を使わない
   const stale = () => items.get(item.id) !== item || item.version !== version;
   if (stale()) return;
   try {
-    decoder ??= new RawDecoder();
     setStatus(item, 'loading', 'RAW を開いています…');
     const meta = await decoder.open(item.file, el.rawSize.value === 'half');
     item.exif = meta.exif;
@@ -260,27 +226,11 @@ function setStatus(item: Item, status: Status, message: string): void {
 function renderItem(item: Item): void {
   const li = item.el;
   li.className = `file ${item.status === 'error' ? 'error' : ''} ${prepared?.referenceId === item.id ? 'reference' : ''}`;
-  li.replaceChildren();
-  const img = document.createElement('img');
-  img.className = 'thumb';
-  img.alt = '';
-  if (item.thumb) img.src = item.thumb;
-  const meta = document.createElement('div');
-  meta.className = 'file-meta';
-  const name = document.createElement('div');
-  name.className = 'file-name';
-  name.textContent = item.file.name;
-  name.title = item.file.name;
-  const sub = document.createElement('div');
-  sub.className = 'file-sub';
-  sub.textContent = item.status === 'ready' ? exposureText(item.exif) : item.message;
-  meta.append(name, sub);
-  const side = document.createElement('div');
-  side.className = 'file-side';
+  const side: HTMLElement[] = [];
   if (item.status === 'loading') {
     const dot = document.createElement('span');
     dot.className = 'loading-dot';
-    side.append(dot);
+    side.push(dot);
   }
   const ev = prepared?.relativeEv[item.id];
   if (item.status === 'ready' && ev !== undefined) {
@@ -289,33 +239,16 @@ function renderItem(item: Item): void {
     badge.className = `ev ${isRef ? 'ref' : ''}`;
     badge.textContent = isRef ? '基準' : formatEv(ev);
     badge.title = isRef ? '合成の基準（中間の露出）' : '基準との露出差（画像から推定）';
-    side.append(badge);
+    side.push(badge);
   }
-  const rm = document.createElement('button');
-  rm.type = 'button';
-  rm.className = 'remove';
-  rm.textContent = '×';
-  rm.title = '削除';
-  rm.setAttribute('aria-label', `${item.file.name} を削除`);
-  rm.onclick = () => removeItem(item.id);
-  side.append(rm);
-  li.append(img, meta, side);
-}
-
-function exposureText(e?: ExposureInfo): string {
-  if (!e) return '';
-  const parts: string[] = [];
-  if (e.exposureTime) parts.push(formatShutter(e.exposureTime));
-  if (e.fNumber) parts.push(`f/${Math.round(e.fNumber * 10) / 10}`);
-  if (e.iso) parts.push(`ISO${e.iso}`);
-  if (!parts.length && e.exposureBias !== undefined) parts.push(`補正 ${formatEv(e.exposureBias)}`);
-  return parts.join(' · ') || '露出情報なし';
-}
-
-function formatEv(ev: number): string {
-  const r = Math.round(ev * 10) / 10;
-  if (Math.abs(r) < 0.05) return '±0EV';
-  return `${r > 0 ? '+' : '−'}${Math.abs(r).toFixed(1)}EV`;
+  fillFileRow(li, {
+    thumb: item.thumb,
+    name: item.file.name,
+    sub: item.status === 'ready' ? exposureText(item.exif) : item.message,
+    side,
+    removeLabel: '削除',
+    onRemove: () => removeItem(item.id),
+  });
 }
 
 function readyItems(): Item[] {
@@ -352,9 +285,9 @@ function updateLoadingOverlay(): void {
   if (loading.length) {
     const done = all.length - loading.length;
     const current = loading.find((i) => i.message && i.message !== '待機中…');
-    showBusy(`画像を読み込み中 ${done + 1}/${all.length}${current ? `（${current.message.replace('…', '')}）` : ''}`, done / all.length);
+    busy.show(`画像を読み込み中 ${done + 1}/${all.length}${current ? `（${current.message.replace('…', '')}）` : ''}`, done / all.length);
   } else if (!processing) {
-    hideBusy();
+    busy.hide();
   }
 }
 
@@ -367,7 +300,7 @@ let processing = false;
 function scheduleProcess(): void {
   // 読み込み完了から合成開始までの間もオーバーレイを出したままにする
   processing = true;
-  showBusy('準備中…', 0);
+  busy.show('準備中…', 0);
   clearTimeout(processTimer);
   processTimer = window.setTimeout(() => void runProcess(), 120);
 }
@@ -380,11 +313,11 @@ async function runProcess(): Promise<void> {
   }
   const gen = generation;
   processing = true;
-  showBusy('準備中…', 0);
+  busy.show('準備中…', 0);
   try {
     const res = await request<'prepared'>(
       (reqId) => ({ type: 'prepare', reqId, align: el.align.checked, previewSide: PREVIEW_SIDE }),
-      (label, f) => showBusy(label, f),
+      (label, f) => busy.show(label, f),
     );
     if (gen !== generation) return;
     manualState.clear();
@@ -401,7 +334,7 @@ async function runProcess(): Promise<void> {
       if (item.status !== 'ready') el.fileList.append(item.el);
       renderItem(item);
     }
-    showBusy('合成中…', 0);
+    busy.show('合成中…', 0);
     await renderOnce(gen, true);
   } catch (e) {
     if (gen === generation) {
@@ -411,7 +344,7 @@ async function runProcess(): Promise<void> {
     }
   } finally {
     processing = false;
-    if (!loadingItems().length) hideBusy();
+    if (!loadingItems().length) busy.hide();
     updateExportState();
   }
 }
@@ -441,7 +374,7 @@ async function renderOnce(gen: number, showProgress: boolean): Promise<void> {
   try {
     const res = await request<'rendered'>(
       (reqId) => ({ type: 'render', reqId, params }),
-      showProgress ? (label, f) => showBusy(label + '…', f) : undefined,
+      showProgress ? (label, f) => busy.show(label + '…', f) : undefined,
     );
     if (gen !== generation || !prepared) return;
     if (res.layout) applyLayout(res.layout.info, res.layout.reference);
@@ -452,7 +385,6 @@ async function renderOnce(gen: number, showProgress: boolean): Promise<void> {
       `${prepared.width}×${prepared.height}`,
       `${prepared.order.length}枚`,
       MODE_NAMES[params.mode],
-      ...(params.look.id !== 'none' && params.look.amount > 0 ? [LOOK_NAMES[params.look.id]] : []),
       !prepared.aligned ? '位置合わせオフ' : shift < 0.05 && rotation < 0.005 ? 'ずれなし' : `位置補正 ${shift.toFixed(1)}px・${rotation.toFixed(2)}°`,
     ].join(' · ');
   } catch (e) {
@@ -465,7 +397,6 @@ function applyLayout(info: PreparedInfo, reference: Uint8ClampedArray): void {
   prepared = info;
   drawRGBA(el.before, reference, info.previewWidth, info.previewHeight);
   updateAlignmentUI();
-  updateLookHint();
 }
 
 /** 自動位置合わせで補正した最大の移動量 [px] と回転 [度] */
@@ -480,12 +411,6 @@ function alignmentStats(info: PreparedInfo): { shift: number; rotation: number; 
   };
 }
 
-function drawRGBA(canvas: HTMLCanvasElement, rgba: Uint8ClampedArray, w: number, h: number): void {
-  canvas.width = w;
-  canvas.height = h;
-  canvas.getContext('2d')!.putImageData(new ImageData(rgba as Uint8ClampedArray<ArrayBuffer>, w, h), 0, 0);
-}
-
 function showViewer(on: boolean): void {
   el.viewer.hidden = !on;
   el.toolbar.hidden = !on;
@@ -493,21 +418,10 @@ function showViewer(on: boolean): void {
   updateLoupeMarker();
 }
 
-function showBusy(label: string, fraction: number): void {
-  el.busy.hidden = false;
-  el.busyLabel.textContent = label;
-  el.busyBar.style.width = `${Math.round(Math.min(1, Math.max(0, fraction)) * 100)}%`;
-}
-
-function hideBusy(): void {
-  el.busy.hidden = true;
-}
-
 // ---------------------------------------------------------------------------
 // パラメータ
 
 let mode: Mode = 'learned';
-let look: LookId = 'none';
 
 const sliders = {
   amount: $<HTMLInputElement>('amount'),
@@ -522,7 +436,6 @@ const sliders = {
   brightness: $<HTMLInputElement>('adj-brightness'),
   contrast: $<HTMLInputElement>('adj-contrast'),
   saturation: $<HTMLInputElement>('adj-saturation'),
-  lookAmount: $<HTMLInputElement>('look-amount'),
   quality: el.exportQuality,
 };
 
@@ -538,8 +451,10 @@ const formats: Partial<Record<keyof typeof sliders, (v: number) => string>> = {
   brightness: (v) => (v > 0 ? `+${v}` : `${v}`),
   contrast: (v) => (v > 0 ? `+${v}` : `${v}`),
   saturation: (v) => (v > 0 ? `+${v}` : `${v}`),
-  lookAmount: (v) => `${v}%`,
 };
+
+/** スライダーの値の表示を今の値に合わせる（bindEvents で用意する） */
+let updateOutputs = (): void => {};
 
 function num(input: HTMLInputElement): number {
   return Number(input.value);
@@ -559,20 +474,12 @@ function currentParams(): RenderParams {
     },
     tone: { strength: num(sliders.toneStrength) / 100, detail: num(sliders.toneDetail) / 100 },
     learned: { exposure: num(sliders.learnedExposure) / 10 },
-    look: { id: look, amount: num(sliders.lookAmount) / 100, tone: el.lookTone.checked },
     adjust: {
       brightness: num(sliders.brightness),
       contrast: num(sliders.contrast),
       saturation: num(sliders.saturation),
     },
   };
-}
-
-function updateOutputs(): void {
-  for (const [key, input] of Object.entries(sliders) as Array<[keyof typeof sliders, HTMLInputElement]>) {
-    const out = input.parentElement?.querySelector('output');
-    if (out) out.textContent = (formats[key] ?? String)(num(input));
-  }
 }
 
 function setMode(m: Mode): void {
@@ -583,64 +490,6 @@ function setMode(m: Mode): void {
   for (const p of document.querySelectorAll<HTMLElement>('.mode-params')) p.hidden = p.dataset.for !== m;
   el.modeHint.textContent = MODE_HINTS[m];
   requestRender();
-}
-
-function setLook(id: LookId): void {
-  look = id;
-  for (const b of document.querySelectorAll<HTMLButtonElement>('[data-look]')) {
-    b.setAttribute('aria-checked', String(b.dataset.look === id));
-  }
-  el.lookParams.hidden = id === 'none';
-  updateLookHint();
-  requestRender();
-}
-
-/** 色の傾向の説明。Leica M10 のときは、センサーの違いをどう変換したか（機種・光源）も添える */
-function updateLookHint(): void {
-  if (look === 'none') {
-    el.lookHint.textContent = 'RAW はカメラの色を正確に再現した癖の少ない色、JPEG は撮ったときの色のままです。';
-    return;
-  }
-  const parts = [
-    'Leica M10 のセンサーの色の出方と、Leica のカメラ内 JPEG の色づくり（Canon の JPEG より彩度は控えめ、肌は赤み寄り、黄緑は黄み寄り）を再現します。',
-    el.lookTone.checked ? '階調も Leica のカメラ内 JPEG のトーンカーブにします。' : '明るさは合成結果のまま残します。',
-  ];
-  const info = prepared?.look;
-  if (info) {
-    if (info.encoding === 'srgb') parts.push('JPEG は Canon のピクチャースタイル「スタンダード」の色を打ち消してから変換します。');
-    if (info.cameraMatched) {
-      parts.push(`この機種の分光感度から変換しています${info.cct ? `（光源の色温度 約 ${Math.round(info.cct / 100) * 100}K）` : ''}。`);
-    } else {
-      parts.push('この機種の分光感度データがないため、色を正確に写すカメラとして変換しています。');
-    }
-  }
-  el.lookHint.textContent = parts.join('');
-}
-
-// ---------------------------------------------------------------------------
-// 比較表示
-
-let comparePos = 0.5;
-
-function setCompare(on: boolean): void {
-  el.compare.setAttribute('aria-pressed', String(on));
-  el.before.hidden = !on;
-  el.handle.hidden = !on;
-  el.labels.hidden = !on;
-  updateCompare();
-}
-
-function updateCompare(): void {
-  const pct = comparePos * 100;
-  el.before.style.clipPath = `inset(0 ${100 - pct}% 0 0)`;
-  el.handle.style.left = `${pct}%`;
-}
-
-function onComparePointer(ev: PointerEvent): void {
-  if (el.before.hidden) return;
-  const r = el.result.getBoundingClientRect();
-  comparePos = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width));
-  updateCompare();
 }
 
 // ---------------------------------------------------------------------------
@@ -806,7 +655,13 @@ function setLoupeFromPointer(ev: PointerEvent): void {
 
 function updateExportState(): void {
   el.exportBtn.disabled = !prepared;
+  el.toLeica.disabled = !prepared;
   el.qualityRow.hidden = el.exportFormat.value !== 'jpeg';
+}
+
+/** 保存するファイル名のもと（基準の写真の名前 + _AEB / _HDR） */
+function outputBaseName(info: PreparedInfo, params: RenderParams): string {
+  return `${baseName(items.get(info.referenceId)?.file.name ?? 'image')}_${params.mode === 'hdr' ? 'HDR' : 'AEB'}`;
 }
 
 async function doExport(): Promise<void> {
@@ -818,64 +673,46 @@ async function doExport(): Promise<void> {
   el.exportBtn.disabled = true;
   el.exportHint.classList.remove('error');
   el.exportHint.textContent = '';
-  showBusy('書き出し中…', 0);
+  busy.show('書き出し中…', 0);
   try {
     const res = await request<'exported'>(
       (reqId) => ({ type: 'export', reqId, params, options }),
-      (label, f) => showBusy(`${label}…`, f),
+      (label, f) => busy.show(`${label}…`, f),
     );
     if (gen !== generation) return;
-    const ref = items.get(prepared.referenceId);
-    const base = (ref?.file.name ?? 'image').replace(/\.[^.]+$/, '');
     const ext = format === 'jpeg' ? 'jpg' : format === 'png' ? 'png' : 'tif';
-    const suffix = params.look.id === 'leica-m10' && params.look.amount > 0 ? '_M10' : '';
-    download(res.blob, `${base}_${params.mode === 'hdr' ? 'HDR' : 'AEB'}${suffix}.${ext}`);
+    download(res.blob, `${outputBaseName(prepared, params)}.${ext}`);
     el.exportHint.textContent = `${res.width}×${res.height}（${formatBytes(res.blob.size)}）を保存しました · ${(res.elapsed / 1000).toFixed(1)} 秒`;
   } catch (e) {
     el.exportHint.classList.add('error');
     el.exportHint.textContent = errorMessage(e);
   } finally {
-    hideBusy();
+    busy.hide();
     updateExportState();
   }
 }
 
-function download(blob: Blob, name: string): void {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = name;
-  document.body.append(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
-}
-
-function formatBytes(n: number): string {
-  return n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.round(n / 1e3)} KB`;
+/**
+ * フル解像度の合成結果を「Leica M10 の色」タブに送る。仕上げ調整の値も引き継ぎ、
+ * これまでの「合成 → Leica M10 の色 → 仕上げ調整」と同じ順に掛かるようにする
+ */
+function sendToLeica(): void {
+  const info = prepared;
+  if (!info) return;
+  const params = currentParams();
+  hooks.openInLeica({
+    name: outputBaseName(info, params),
+    detail: `${info.order.length} 枚・${MODE_NAMES[params.mode]}`,
+    adjust: params.adjust,
+    load: (progress) => request<'merged'>((reqId) => ({ type: 'merge', reqId, params }), progress).then((m) => m.image),
+  });
 }
 
 // ---------------------------------------------------------------------------
 // その他
 
-let toastTimer = 0;
-function toast(message: string, error = false): void {
-  document.querySelector('.toast')?.remove();
-  const t = document.createElement('div');
-  t.className = `toast ${error ? 'error' : ''}`;
-  t.setAttribute('role', 'status');
-  t.textContent = message;
-  document.body.append(t);
-  clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => t.remove(), error ? 8000 : 4000);
-}
-
-function errorMessage(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
-
 function bindEvents(): void {
-  el.fileInput.accept = `image/*,${RAW_ACCEPT}`;
+  el.fileInput.accept = FILE_ACCEPT;
   $('pick-files').onclick = () => el.fileInput.click();
   $('add-files').onclick = () => el.fileInput.click();
   $('clear-files').onclick = () => {
@@ -885,32 +722,6 @@ function bindEvents(): void {
     addFiles([...(el.fileInput.files ?? [])]);
     el.fileInput.value = '';
   };
-
-  // ドラッグ＆ドロップ（ページ全体で受け付ける）
-  let depth = 0;
-  window.addEventListener('dragenter', (e) => {
-    if (!e.dataTransfer?.types.includes('Files')) return;
-    e.preventDefault();
-    depth++;
-    document.body.classList.add('dragging');
-  });
-  window.addEventListener('dragover', (e) => {
-    if (!e.dataTransfer?.types.includes('Files')) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'copy';
-  });
-  window.addEventListener('dragleave', () => {
-    if (--depth <= 0) {
-      depth = 0;
-      document.body.classList.remove('dragging');
-    }
-  });
-  window.addEventListener('drop', (e) => {
-    e.preventDefault();
-    depth = 0;
-    document.body.classList.remove('dragging');
-    addFiles([...(e.dataTransfer?.files ?? [])]);
-  });
 
   el.rawSize.onchange = () => {
     const raws = [...items.values()].filter((i) => i.raw);
@@ -928,43 +739,27 @@ function bindEvents(): void {
   for (const b of document.querySelectorAll<HTMLButtonElement>('.segmented [data-mode]')) {
     b.onclick = () => setMode(b.dataset.mode as Mode);
   }
-  for (const b of document.querySelectorAll<HTMLButtonElement>('[data-look]')) {
-    b.onclick = () => setLook(b.dataset.look as LookId);
-  }
-  el.lookTone.onchange = () => {
-    updateLookHint();
-    requestRender();
-  };
-  for (const input of Object.values(sliders)) {
-    input.addEventListener('input', () => {
-      updateOutputs();
-      if (input !== sliders.quality) requestRender();
-    });
-    // ダブルクリックで初期値に戻す
-    input.addEventListener('dblclick', () => {
-      input.value = input.defaultValue;
-      input.dispatchEvent(new Event('input'));
-    });
-  }
+  updateOutputs = bindSliders(sliders, formats, (key) => {
+    if (key !== 'quality') requestRender();
+  });
   $('reset-adjust').onclick = () => {
     for (const s of [sliders.brightness, sliders.contrast, sliders.saturation]) s.value = s.defaultValue;
     updateOutputs();
     requestRender();
   };
 
-  el.compare.onclick = () => setCompare(el.compare.getAttribute('aria-pressed') !== 'true');
   // プレビュー上のドラッグ: 比較中は境界線、手動調整中はルーペの位置
   let dragging: 'compare' | 'loupe' | null = null;
   el.canvasWrap.addEventListener('pointerdown', (e) => {
-    if (!el.before.hidden) dragging = 'compare';
+    if (compare.on) dragging = 'compare';
     else if (el.manualAlign.open && prepared) dragging = 'loupe';
     else return;
     el.canvasWrap.setPointerCapture(e.pointerId);
-    if (dragging === 'compare') onComparePointer(e);
+    if (dragging === 'compare') compare.moveTo(e);
     else setLoupeFromPointer(e);
   });
   el.canvasWrap.addEventListener('pointermove', (e) => {
-    if (dragging === 'compare') onComparePointer(e);
+    if (dragging === 'compare') compare.moveTo(e);
     else if (dragging === 'loupe') setLoupeFromPointer(e);
   });
   el.canvasWrap.addEventListener('pointerup', () => (dragging = null));
@@ -988,9 +783,9 @@ function bindEvents(): void {
   }
   // 手動調整中はキーボードでも動かせる（矢印キーで移動、[ ] で回転）
   window.addEventListener('keydown', (e) => {
-    if (!el.manualAlign.open || !prepared) return;
+    if (!hooks.isActive() || !el.manualAlign.open || !prepared) return;
     const target = e.target as HTMLElement;
-    if (target.closest('input, select, textarea')) return;
+    if (target.closest('input, select, textarea, [role="tab"]')) return;
     const map: Record<string, string> = {
       ArrowLeft: 'left',
       ArrowRight: 'right',
@@ -1007,21 +802,14 @@ function bindEvents(): void {
 
   el.exportFormat.onchange = updateExportState;
   el.exportBtn.onclick = () => void doExport();
-  $('open-help').onclick = () => el.help.showModal();
+  el.toLeica.onclick = sendToLeica;
 }
 
-async function init(): Promise<void> {
+/** タブを用意する。ドロップされたファイルは addFiles で受け取る */
+export function initAeb(h: AebHooks): { addFiles: (files: File[]) => void } {
+  hooks = h;
   bindEvents();
-  updateOutputs();
   setMode('learned');
-  setLook('none');
   updateExportState();
-  const isolated = await ensureCrossOriginIsolation();
-  if (!isolated) {
-    el.banner.hidden = false;
-    el.banner.textContent =
-      'このブラウザ環境では RAW の読み込み機能が使えません（JPEG / PNG は使えます）。通常ウィンドウの最新の Chrome / Edge / Firefox / Safari でお試しください。';
-  }
+  return { addFiles };
 }
-
-void init();

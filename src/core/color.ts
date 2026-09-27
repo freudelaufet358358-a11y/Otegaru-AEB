@@ -62,6 +62,20 @@ export function displayLut(encoding: Encoding): Float32Array {
 }
 
 /**
+ * 16bit 符号値を表示用 (sRGB) の 16bit にする。RAW（リニア）はアプリの素の表示（sRGB + 肩特性）に変換し、
+ * JPEG などはそのまま使う（out が data と別ならコピーする）。
+ */
+export function toDisplay16(data: Uint16Array, encoding: Encoding, out: Uint16Array = new Uint16Array(data.length)): Uint16Array {
+  if (encoding === 'srgb') {
+    if (out !== data) out.set(data);
+    return out;
+  }
+  const lut = displayLut(encoding);
+  for (let i = 0; i < data.length; i++) out[i] = lut[data[i]] * 65535 + 0.5;
+  return out;
+}
+
+/**
  * リニア値 (0..1) → sRGB 符号値の高速変換用テーブル。
  * 65536 分割 + 線形補間で 16bit 出力にも十分な精度になる。
  */

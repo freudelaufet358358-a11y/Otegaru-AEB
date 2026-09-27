@@ -116,9 +116,9 @@ select {
 /* ヘッダ */
 .topbar {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0.55rem 1rem;
+  align-items: stretch;
+  gap: 1.5rem;
+  padding: 0 1rem;
   border-bottom: 1px solid var(--border);
   background: var(--surface);
 }
@@ -127,18 +127,46 @@ select {
   align-items: center;
   gap: 0.6rem;
   min-width: 0;
+  padding: 0.55rem 0;
 }
 .brand h1 {
   font-size: 1.1rem;
   margin: 0;
   white-space: nowrap;
 }
-.tagline {
+#open-help {
+  align-self: center;
+  margin-left: auto;
+}
+
+/* タブ（AEB 合成 / Leica M10 の色） */
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+}
+.tab {
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
+  margin-bottom: -1px;
+  padding: 0 0.85em;
   color: var(--text-dim);
-  font-size: 0.85rem;
+  font-weight: 600;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+}
+.tab:hover:not(:disabled) {
+  background: none;
+  color: var(--text);
+}
+.tab[aria-selected='true'],
+.tab[aria-selected='true']:hover:not(:disabled) {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+.tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -4px;
 }
 
 .banner {
@@ -174,8 +202,9 @@ select {
   gap: 0.75rem;
 }
 @media (min-width: 901px) {
+  /* ヘッダ（とお知らせ）の残りの高さに収める */
   .layout {
-    height: calc(100vh - 49px);
+    grid-template-rows: minmax(0, 1fr);
   }
 }
 @media (max-width: 900px) {
@@ -186,8 +215,20 @@ select {
     border-left: none;
     border-top: 1px solid var(--border);
   }
-  .tagline {
-    display: none;
+  /* スマートフォンではタブをヘッダの 2 段目に、横いっぱいに並べる */
+  .topbar {
+    flex-wrap: wrap;
+    row-gap: 0;
+  }
+  .tabs {
+    order: 3;
+    flex-basis: calc(100% + 2rem);
+    margin: 0 -1rem;
+    border-top: 1px solid var(--border);
+  }
+  .tab {
+    flex: 1;
+    padding: 0.6em 0.5em;
   }
 }
 
@@ -216,8 +257,12 @@ select {
   stroke: #4a515e;
   stroke-width: 1.5;
 }
-.dropzone-icon rect.accent {
+.dropzone-icon .accent {
   fill: #ff8a4c;
+  stroke: none;
+}
+.dropzone-icon .muted {
+  fill: #4a515e;
   stroke: none;
 }
 .dropzone-title {
@@ -237,6 +282,15 @@ select {
   color: var(--text-dim);
   font-size: 0.8rem;
   margin-top: 1rem;
+}
+.dropzone-alt {
+  color: var(--text-dim);
+  font-size: 0.85rem;
+  margin: 0.9rem 0 0;
+}
+.dropzone-alt .link-button {
+  color: var(--accent);
+  padding: 0;
 }
 body.dragging .dropzone,
 body.dragging .stage {
@@ -287,13 +341,18 @@ body.dragging .stage {
     margin: 0.75rem;
     padding: 1rem;
   }
+  /* 画像を選ぶ前は、ドロップ欄の説明が収まるようにプレビューの枠を広げる */
+  .stage:has(> .dropzone:not([hidden])) {
+    height: auto;
+    min-height: 50vh;
+  }
   .loupe-overlay {
     width: 40%;
     right: 8px;
     bottom: 50px;
   }
 }
-#canvas-before {
+.canvas-wrap .canvas-before {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -500,7 +559,7 @@ body.dragging .stage {
   gap: 0.4rem;
 }
 .file-list:empty::before {
-  content: 'まだ画像がありません';
+  content: attr(data-empty);
   color: var(--text-dim);
   font-size: 0.85rem;
 }
@@ -780,6 +839,16 @@ details[open] > summary {
   flex-direction: column;
   gap: 0.5rem;
 }
+
+/* 「AEB 合成」から「Leica M10 の色」へ送るボタン */
+.handoff {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.2rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
 .mode-params[hidden] {
   display: none;
 }
@@ -798,6 +867,9 @@ dialog::backdrop {
 }
 dialog h2 {
   margin-top: 0;
+}
+dialog h2:focus {
+  outline: none;
 }
 dialog h3 {
   font-size: 0.95rem;

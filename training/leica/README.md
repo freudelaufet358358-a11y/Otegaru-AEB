@@ -1,6 +1,6 @@
 # 「Leica M10」の色の調査と当てはめ
 
-アプリの仕上げの「Leica M10」は、このフォルダのスクリプトで求めたモデル（`src/models/leica-m10.json`、約 22KB）を使います。
+アプリの「Leica M10 の色」タブは、このフォルダのスクリプトで求めたモデル（`src/models/leica-m10.json`、約 22KB）を使います。
 調査の結果と考え方は [docs/leica-m10-color.md](../../docs/leica-m10-color.md) にまとめています。ここでは再現の手順だけを書きます。
 
 ## 使うデータ

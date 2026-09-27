@@ -6,7 +6,7 @@
     <title>お手軽AEB合成</title>
     <meta
       name="description"
-      content="オートブラケット（AEB）で撮った写真をブラウザだけでHDR合成。Canon EOS R6 Mark II の CR3 RAW にも対応。画像は外部に送信されません。"
+      content="オートブラケット（AEB）で撮った写真のHDR合成と、写真 1 枚からでも使える Leica M10 の色の再現をブラウザだけで。Canon EOS R6 Mark II の CR3 RAW にも対応。画像は外部に送信されません。"
     />
     <meta name="color-scheme" content="dark" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
@@ -16,15 +16,22 @@
       <div class="brand">
         <img src="favicon.svg" alt="" width="28" height="28" />
         <h1>お手軽AEB合成</h1>
-        <span class="tagline">ブラケット写真をブラウザだけでHDR合成</span>
       </div>
+      <nav class="tabs" id="tabs" role="tablist" aria-label="機能">
+        <button type="button" class="tab" role="tab" id="tab-aeb" aria-controls="panel-aeb" aria-selected="true">
+          AEB 合成
+        </button>
+        <button type="button" class="tab" role="tab" id="tab-leica" aria-controls="panel-leica" aria-selected="false" tabindex="-1">
+          Leica M10 の色
+        </button>
+      </nav>
       <button type="button" class="link-button" id="open-help">使い方</button>
     </header>
 
     <div class="banner" id="banner" hidden></div>
 
-    <main class="layout">
-      <section class="stage" id="stage" aria-label="プレビュー">
+    <main class="layout" id="panel-aeb" role="tabpanel" aria-labelledby="tab-aeb">
+      <section class="stage" aria-label="プレビュー">
         <div class="dropzone" id="dropzone">
           <svg class="dropzone-icon" viewBox="0 0 64 64" aria-hidden="true">
             <rect x="6" y="18" width="30" height="30" rx="6" />
@@ -37,13 +44,17 @@
             <strong>CR3（EOS R6 Mark II など）</strong>・CR2・NEF・ARW・DNG などの RAW、JPEG / PNG に対応
           </p>
           <button type="button" class="primary" id="pick-files">ファイルを選択</button>
+          <p class="dropzone-alt">
+            1 枚の写真を Leica M10 の色にするときは
+            <button type="button" class="link-button" data-goto="leica">「Leica M10 の色」タブへ</button>
+          </p>
           <p class="privacy">🔒 画像はこの端末の中だけで処理され、どこにも送信されません</p>
         </div>
 
         <div class="viewer" id="viewer" hidden>
           <div class="canvas-wrap" id="canvas-wrap">
             <canvas id="canvas-result"></canvas>
-            <canvas id="canvas-before" hidden></canvas>
+            <canvas class="canvas-before" id="canvas-before" hidden></canvas>
             <div class="compare-handle" id="compare-handle" hidden><span></span></div>
             <div class="loupe-marker" id="loupe-marker" hidden></div>
             <div class="compare-labels" id="compare-labels" hidden>
@@ -60,8 +71,8 @@
         <div class="busy" id="busy" hidden>
           <div class="busy-box">
             <div class="spinner" aria-hidden="true"></div>
-            <div class="busy-label" id="busy-label">処理中…</div>
-            <div class="bar"><div class="bar-fill" id="busy-bar"></div></div>
+            <div class="busy-label">処理中…</div>
+            <div class="bar"><div class="bar-fill"></div></div>
           </div>
         </div>
 
@@ -75,7 +86,7 @@
       <aside class="panel">
         <section class="card">
           <h2><span class="step">1</span>画像 <span class="count" id="file-count"></span></h2>
-          <ul class="file-list" id="file-list"></ul>
+          <ul class="file-list" id="file-list" data-empty="まだ画像がありません"></ul>
           <div class="row">
             <button type="button" id="add-files">＋ 追加</button>
             <button type="button" id="clear-files" class="ghost">すべて削除</button>
@@ -170,21 +181,13 @@
 
         <section class="card">
           <h2><span class="step">4</span>仕上げ <button type="button" class="link-button small" id="reset-adjust">リセット</button></h2>
-          <div class="segmented" role="radiogroup" aria-label="色の傾向">
-            <button type="button" role="radio" data-look="none" aria-checked="true">標準<small>カメラの色そのまま</small></button>
-            <button type="button" role="radio" data-look="leica-m10" aria-checked="false">Leica M10<small>センサー＋色づくり</small></button>
-          </div>
-          <div id="look-params" hidden>
-            <label class="slider"><span>Leica の効き</span><input type="range" id="look-amount" min="0" max="100" value="100" /><output></output></label>
-            <label class="switch">
-              <input type="checkbox" id="look-tone" />
-              <span>階調も Leica のカメラ内 JPEG に合わせる（暗部が沈み、メリハリが強くなります）</span>
-            </label>
-          </div>
-          <p class="hint" id="look-hint"></p>
           <label class="slider"><span>明るさ</span><input type="range" id="adj-brightness" min="-100" max="100" value="0" /><output></output></label>
           <label class="slider"><span>コントラスト</span><input type="range" id="adj-contrast" min="-100" max="100" value="0" /><output></output></label>
           <label class="slider"><span>彩度</span><input type="range" id="adj-saturation" min="-100" max="100" value="0" /><output></output></label>
+          <div class="handoff">
+            <button type="button" class="wide" id="to-leica" disabled>Leica M10 の色にする →</button>
+            <p class="hint">合成した写真を「Leica M10 の色」タブで開き、Leica M10 で撮ったような色に仕上げます（明るさなどの仕上げも引き継ぎます）。</p>
+          </div>
         </section>
 
         <section class="card">
@@ -215,17 +218,127 @@
       </aside>
     </main>
 
+    <main class="layout" id="panel-leica" role="tabpanel" aria-labelledby="tab-leica" hidden>
+      <section class="stage" aria-label="プレビュー">
+        <div class="dropzone" id="leica-dropzone">
+          <svg class="dropzone-icon" viewBox="0 0 64 64" aria-hidden="true">
+            <rect x="8" y="12" width="48" height="40" rx="6" />
+            <path class="muted" d="M13 46 L27 30 L36 39 L42 33 L51 46 Z" />
+            <circle class="accent" cx="43" cy="22" r="5" />
+          </svg>
+          <p class="dropzone-title">Leica M10 の色にしたい写真をここにドロップ</p>
+          <p class="dropzone-sub">
+            写真を 1 枚選んでください（AEB で撮っていない写真でも使えます）<br />
+            <strong>CR3（EOS R6 Mark II など）</strong>・CR2・NEF・ARW・DNG などの RAW、JPEG / PNG に対応
+          </p>
+          <button type="button" class="primary" id="leica-pick">ファイルを選択</button>
+          <p class="dropzone-alt">
+            AEB で合成した写真は
+            <button type="button" class="link-button" data-goto="aeb">「AEB 合成」タブ</button>の「仕上げ」にある「Leica M10 の色にする」から送れます
+          </p>
+          <p class="privacy">🔒 画像はこの端末の中だけで処理され、どこにも送信されません</p>
+        </div>
+
+        <div class="viewer" id="leica-viewer" hidden>
+          <div class="canvas-wrap" id="leica-canvas-wrap">
+            <canvas id="leica-result"></canvas>
+            <canvas class="canvas-before" id="leica-before" hidden></canvas>
+            <div class="compare-handle" id="leica-compare-handle" hidden><span></span></div>
+            <div class="compare-labels" id="leica-compare-labels" hidden>
+              <span>標準の色</span><span>Leica M10</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="busy" id="leica-busy" hidden>
+          <div class="busy-box">
+            <div class="spinner" aria-hidden="true"></div>
+            <div class="busy-label">処理中…</div>
+            <div class="bar"><div class="bar-fill"></div></div>
+          </div>
+        </div>
+
+        <div class="stage-toolbar" id="leica-toolbar" hidden>
+          <button type="button" class="chip" id="leica-compare" aria-pressed="false">比較</button>
+          <span class="stage-info" id="leica-info"></span>
+          <span class="mini-spinner" id="leica-spinner" hidden></span>
+        </div>
+      </section>
+
+      <aside class="panel">
+        <section class="card">
+          <h2><span class="step">1</span>写真</h2>
+          <ul class="file-list" id="leica-source" data-empty="まだ写真がありません"></ul>
+          <div class="row">
+            <button type="button" id="leica-open">写真を選ぶ</button>
+          </div>
+          <p class="hint">RAW（CR3 など）でも JPEG でも使えます。1 枚ずつ仕上げます。</p>
+        </section>
+
+        <section class="card">
+          <h2><span class="step">2</span>Leica M10 の色</h2>
+          <label class="slider"><span>Leica の効き</span><input type="range" id="leica-amount" min="0" max="100" value="100" /><output></output></label>
+          <label class="switch">
+            <input type="checkbox" id="leica-tone" checked />
+            <span>階調も Leica のカメラ内 JPEG に合わせる（暗部が沈み、メリハリが強くなります）</span>
+          </label>
+          <p class="hint" id="leica-hint"></p>
+        </section>
+
+        <section class="card">
+          <h2><span class="step">3</span>仕上げ <button type="button" class="link-button small" id="leica-reset-adjust">リセット</button></h2>
+          <label class="slider"><span>明るさ</span><input type="range" id="leica-brightness" min="-100" max="100" value="0" /><output></output></label>
+          <label class="slider"><span>コントラスト</span><input type="range" id="leica-contrast" min="-100" max="100" value="0" /><output></output></label>
+          <label class="slider"><span>彩度</span><input type="range" id="leica-saturation" min="-100" max="100" value="0" /><output></output></label>
+        </section>
+
+        <section class="card">
+          <h2><span class="step">4</span>保存</h2>
+          <div class="grid2">
+            <label class="field">
+              <span>形式</span>
+              <select id="leica-export-format">
+                <option value="jpeg">JPEG</option>
+                <option value="png">PNG</option>
+                <option value="tiff">TIFF（16bit）</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>サイズ</span>
+              <select id="leica-export-size">
+                <option value="0">元のサイズ</option>
+                <option value="4000">長辺 4000px</option>
+                <option value="2048">長辺 2048px</option>
+                <option value="1080">長辺 1080px（SNS 向け）</option>
+              </select>
+            </label>
+          </div>
+          <label class="slider" id="leica-quality-row"><span>JPEG 品質</span><input type="range" id="leica-export-quality" min="60" max="100" value="92" /><output></output></label>
+          <button type="button" class="primary wide" id="leica-export" disabled>画像を保存</button>
+          <p class="hint" id="leica-export-hint"></p>
+        </section>
+      </aside>
+    </main>
+
     <dialog id="help">
       <form method="dialog">
-        <h2>使い方</h2>
+        <h2 tabindex="-1" autofocus>使い方</h2>
+        <h3>AEB 合成</h3>
         <ol>
           <li>カメラの AEB（オートブラケット）で、露出を変えて撮った写真を 2〜9 枚用意します。</li>
           <li>写真をまとめてドロップ（またはファイルを選択）すると、自動で位置合わせして合成します。</li>
           <li>「おまかせ」は約 3,500 シーンの写真で学習したモデルが写真らしいバランスに仕上げます。「ナチュラル」は露出フュージョン、「HDR」は暗部と明部をしっかり起こす HDR 調です。</li>
           <li>「効果の強さ」で合成の効き具合を、「ディテール」で立体感を調整できます。</li>
           <li>輪郭が二重に見えるときは「位置合わせ」→「手動で微調整する」で、ルーペを見ながら写真ごとに位置と傾きを直せます。</li>
-          <li>「仕上げ」の「Leica M10」を選ぶと、Leica M10 で撮ったような色（センサーの違いと Leica のカメラ内 JPEG の色づくり）になります。</li>
           <li>「比較」で合成前と見比べ、仕上げを調整したら「画像を保存」。</li>
+          <li>Leica M10 の色にしたいときは、「仕上げ」の「Leica M10 の色にする」で合成した写真を「Leica M10 の色」タブに送ります。</li>
+        </ol>
+        <h3>Leica M10 の色</h3>
+        <ol>
+          <li>「Leica M10 の色」タブで写真を 1 枚ドロップ（またはファイルを選択）します。AEB で撮っていない写真でも、RAW（CR3 など）でも JPEG でも使えます。</li>
+          <li>Leica M10 で撮ったような色（センサーの違いと Leica のカメラ内 JPEG の色づくり）になります。「Leica の効き」で強さを調整できます。</li>
+          <li>「階調も Leica のカメラ内 JPEG に合わせる」をオンにすると、明るさの付け方（暗部の沈み方・ハイライトのなだらかさ）も Leica の JPEG に合わせます。1 枚の写真ではオン、AEB の合成結果ではオフ（HDR 合成で起こした暗部を残す）が既定です。</li>
+          <li>「比較」で標準の色と見比べ、仕上げを調整したら「画像を保存」。</li>
         </ol>
         <h3>EOS R6 Mark II で撮るときのコツ</h3>
         <ul>
@@ -244,6 +357,7 @@
     </dialog>
 
     <input type="file" id="file-input" multiple hidden />
-    <script type="module" src="/src/aeb.ts"></script>
+    <input type="file" id="leica-file-input" hidden />
+    <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

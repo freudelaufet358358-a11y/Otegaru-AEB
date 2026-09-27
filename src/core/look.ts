@@ -1,4 +1,5 @@
-// 「Leica M10」の色（カラールック）。合成・トーンマッピングを終えた表示用の画像（sRGB）に掛ける。
+// 「Leica M10」の色（カラールック）。表示用の画像（sRGB）に掛ける: 1 枚の写真（RAW はアプリの素の表示、
+// JPEG などはそのまま）か、AEB の合成・トーンマッピングを終えた結果。
 // Leica M10 と Canon の色の違いの調査（training/leica/）で求めたモデルを使う:
 //
 //  1. 表示用の値をシーンのリニア値に戻す（LeicaLook.toLinear を参照）
@@ -10,24 +11,20 @@
 //
 // 中間グレー（18%）は Leica のカメラ内 JPEG と同じ明るさ（sRGB 118.9）に合わせる。
 //
-// 既定では明るさ（輝度）は元の画像のまま残し、色相・彩度だけを Leica のカメラ内 JPEG に合わせる。
+// tone が 0 なら明るさ（輝度）は元の画像のまま残し、色相・彩度だけを Leica のカメラ内 JPEG に合わせる。
 // Leica の JPEG のトーンカーブは暗部を深く沈める（中間グレーの 4 段下で sRGB 8 程度）ので、そのまま掛けると
-// HDR 合成で起こした暗部がまたつぶれてしまうため。tone を 1 にするとトーンカーブも Leica のものにする。
+// HDR 合成で起こした暗部がまたつぶれてしまうため（アプリでは AEB の合成結果の既定）。
+// tone を 1 にするとトーンカーブも Leica のものにする（アプリでは 1 枚の写真の既定）。
 // 数式は training/leica/export_model.py の apply_look と 1 対 1 に対応させている。
 
 import { fastLinearToSrgb, linearLut, linearToSrgb, LUMA_B, LUMA_G, LUMA_R, shoulderInverse, srgbToLinear, type Encoding } from './color';
 
-export type LookId = 'none' | 'leica-m10';
-
 export interface LookParams {
-  id: LookId;
   /** 効き 0..1（0 で元のまま） */
   amount: number;
   /** 明るさ（トーンカーブ）も Leica のカメラ内 JPEG に合わせる */
   tone: boolean;
 }
-
-export const DEFAULT_LOOK: LookParams = { id: 'none', amount: 1, tone: false };
 
 /** 3×3 行列（行優先） */
 type Mat3 = Float64Array;

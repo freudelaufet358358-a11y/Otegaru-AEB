@@ -1,17 +1,16 @@
-// 合成処理を担当するワーカー。フレームを保持し、位置合わせ・プレビュー生成・書き出しを行う。
+// 「AEB 合成」の合成処理を担当するワーカー。フレームを保持し、位置合わせ・プレビュー生成・書き出しと、
+// 「Leica M10 の色」に渡すフル解像度の合成を行う。
 
-import { blendWithReference, toRGB16, toRGBA8, DEFAULT_ADJUSTMENTS } from '../core/adjust';
+import { blendWithReference, toRGBA8, DEFAULT_ADJUSTMENTS } from '../core/adjust';
 import { alignFrames, toGray8 } from '../core/align';
-import { displayLut, linearLut, linearToDisplay, LUMA_B, LUMA_G, LUMA_R, RAW_DISPLAY_GAIN } from '../core/color';
-import { buildExifApp1, exposureValue, formatExifDate, insertExif, readExif, type ExposureInfo } from '../core/exif';
+import { displayLut, linearLut, linearToDisplay, LUMA_B, LUMA_G, LUMA_R, RAW_DISPLAY_GAIN, toDisplay16 } from '../core/color';
+import { exposureValue, type ExposureInfo } from '../core/exif';
 import { fitSize, fullView, resizeView, rowIndex, type Frame16, type View } from '../core/frame';
 import { exposureFusion, type ProgressFn } from '../core/fusion';
 import { estimateExposures, toneMapHDR } from '../core/hdr';
 import { parseToneModel, predictGrid, radianceThumbnail, renderLearned, type ToneGrid, type ToneModel } from '../core/learned';
-import { DEFAULT_LOOK, LeicaLook, parseLookModel, type LookParams } from '../core/look';
-import { encodeTiff16 } from '../core/tiff';
-import lookModelJson from '../models/leica-m10.json';
 import modelUrl from '../models/tone-hdrplus.bin?url';
+import { decodeImageFile, encodePixels, finishPixels } from './image-io';
 import {
   angleDegrees,
   apply,
@@ -30,9 +29,9 @@ import type {
   ExportOptions,
   FrameAlignment,
   FromWorker,
-  LookInfo,
   LoupeMode,
   ManualAdjust,
+  MergedImage,
   PreparedInfo,
   RawColor,
   RenderParams,
@@ -66,10 +65,6 @@ interface Prepared {
   layoutDirty: boolean;
   /** おまかせモードのグリッド（プレビュー用フレームから求め、書き出しでも同じものを使う） */
   toneGrid: ToneGrid | null;
-  /** Leica M10 の色（基準の写真の機種・ホワイトバランスに合わせて用意する） */
-  leica: LeicaLook;
-  /** 最後に送った比較用の画像（基準フレーム）に掛けた色の傾向 */
-  referenceLook: string;
 }
 
 const NO_MANUAL: ManualAdjust = { x: 0, y: 0, rotation: 0 };
@@ -79,7 +74,6 @@ const ctx = self as unknown as {
   onmessage: ((ev: MessageEvent<ToWorker>) => void) | null;
 };
 
-const lookModel = parseLookModel(lookModelJson);
 const entries = new Map<string, Entry>();
 let prepared: Prepared | null = null;
 let cache: { key: string; display: Uint16Array; width: number; height: number } | null = null;
@@ -113,10 +107,10 @@ async function handle(msg: ToWorker): Promise<void> {
       break;
     }
     case 'addFile': {
-      const entry = await decodeImageFile(msg.id, msg.name, msg.file);
-      entries.set(msg.id, entry);
+      const { frame, exif } = await decodeImageFile(msg.file);
+      entries.set(msg.id, { id: msg.id, name: msg.name, frame, exif });
       invalidate();
-      post({ type: 'added', id: msg.id, width: entry.frame.width, height: entry.frame.height, exif: entry.exif });
+      post({ type: 'added', id: msg.id, width: frame.width, height: frame.height, exif });
       break;
     }
     case 'remove':
@@ -150,9 +144,9 @@ async function handle(msg: ToWorker): Promise<void> {
       const p = requirePrepared();
       const t = performance.now();
       let layout: { info: PreparedInfo; reference: Uint8ClampedArray } | undefined;
-      if (p.layoutDirty || p.referenceLook !== lookKey(msg.params.look)) {
+      if (p.layoutDirty) {
         ensureLayout(p);
-        layout = { info: p.info, reference: referenceRGBA(p, msg.params.look) };
+        layout = { info: p.info, reference: referenceRGBA(p) };
       }
       const key = baseKey(msg.params);
       if (!cache || cache.key !== key) {
@@ -165,11 +159,6 @@ async function handle(msg: ToWorker): Promise<void> {
       if (msg.params.amount < 1) {
         const ref = p.preview[p.refIndex];
         display = blendWithReference(display, fullView(ref), displayLut(ref.encoding), msg.params.amount, new Uint16Array(display.length));
-      }
-      if (msg.params.look.id !== 'none') {
-        // キャッシュを書き換えないよう、効果の強さで新しく作った配列でなければコピーに掛ける
-        const out = display === cache.display ? new Uint16Array(display.length) : display;
-        display = applyLook(p, msg.params.look, display, out, lookJpegBase(msg.params));
       }
       const rgba = new Uint8ClampedArray(cache.width * cache.height * 4);
       toRGBA8(display, msg.params.adjust, rgba);
@@ -189,6 +178,11 @@ async function handle(msg: ToWorker): Promise<void> {
       post({ type: 'exported', reqId: msg.reqId, blob, width, height, elapsed: performance.now() - t });
       break;
     }
+    case 'merge': {
+      const image = await mergedImage(msg.params, (label, f) => post({ type: 'progress', reqId: msg.reqId, label, fraction: f }));
+      post({ type: 'merged', reqId: msg.reqId, image }, [image.data.buffer]);
+      break;
+    }
   }
 }
 
@@ -200,31 +194,6 @@ function invalidate(): void {
 function requirePrepared(): Prepared {
   if (!prepared) throw new Error('先に画像を読み込んでください');
   return prepared;
-}
-
-async function decodeImageFile(id: string, name: string, file: File): Promise<Entry> {
-  const head = await file.slice(0, 512 * 1024).arrayBuffer();
-  const exif = readExif(head);
-  let bitmap: ImageBitmap;
-  try {
-    bitmap = await createImageBitmap(file, { colorSpaceConversion: 'default', premultiplyAlpha: 'none' });
-  } catch {
-    throw new Error('この形式はブラウザで読み込めません');
-  }
-  const { width, height } = bitmap;
-  const canvas = new OffscreenCanvas(width, height);
-  const g = canvas.getContext('2d', { willReadFrequently: true });
-  if (!g) throw new Error('Canvas が使えません');
-  g.drawImage(bitmap, 0, 0);
-  bitmap.close();
-  const px = g.getImageData(0, 0, width, height).data;
-  const data = new Uint16Array(width * height * 3);
-  for (let i = 0, j = 0; i < px.length; i += 4, j += 3) {
-    data[j] = px[i] * 257;
-    data[j + 1] = px[i + 1] * 257;
-    data[j + 2] = px[i + 2] * 257;
-  }
-  return { id, name, frame: { width, height, data, encoding: 'srgb' }, exif };
 }
 
 /** LUT で変換した輝度の平均（間引いて計算） */
@@ -308,14 +277,6 @@ function prepare(align: boolean, previewSide: number, progress: (label: string, 
     preview: [],
     layoutDirty: true,
     toneGrid: null,
-    leica: new LeicaLook(lookModel, {
-      encoding: sorted[refIndex].frame.encoding,
-      make: sorted[refIndex].exif.make,
-      model: sorted[refIndex].exif.model,
-      neutral: sorted[refIndex].color?.neutral,
-      camXyz: sorted[refIndex].color?.camXyz,
-    }),
-    referenceLook: 'none',
   };
   updateTransforms(p);
 
@@ -381,44 +342,14 @@ function ensureLayout(p: Prepared): void {
     alignment,
     relativeEv: p.info?.relativeEv ?? {},
     aligned: p.aligned,
-    look: lookInfo(p),
   };
 }
 
-function lookInfo(p: Prepared): LookInfo {
-  return { encoding: p.entries[p.refIndex].frame.encoding, cameraMatched: p.leica.cameraMatched, cct: p.leica.cct };
-}
-
-function lookKey(look: LookParams): string {
-  return look.id === 'none' || look.amount <= 0 ? 'none' : `${look.id}:${look.amount}:${look.tone}`;
-}
-
-/**
- * 合成結果に色の傾向を掛けるとき、表示用の値を「カメラ内 JPEG 並みのトーン」として戻す割合（LeicaLook.toLinear）。
- * おまかせは HDR+ の仕上がり（カメラ内 JPEG 並みのメリハリ）を学習しているのでその分だけ、
- * 効果の強さで基準フレーム（素の表示）と混ぜた分は素の表示として戻す
- */
-function lookJpegBase(params: RenderParams): number {
-  return params.mode === 'learned' ? params.amount : 0;
-}
-
-/** 色の傾向（Leica M10 など）を表示用 16bit RGB に掛ける */
-function applyLook(p: Prepared, look: LookParams, src: Uint16Array, out: Uint16Array = src, jpegBase = 0): Uint16Array {
-  if (look.id === 'leica-m10') return p.leica.apply(src, look.amount, out, jpegBase, look.tone ? 1 : 0);
-  if (out !== src) out.set(src);
-  return out;
-}
-
-/** 基準フレームをそのまま表示した画像（比較用）。合成結果と同じ色の傾向を掛ける */
-function referenceRGBA(p: Prepared, look: LookParams = DEFAULT_LOOK): Uint8ClampedArray {
+/** 基準フレームをそのまま表示した画像（比較用） */
+function referenceRGBA(p: Prepared): Uint8ClampedArray {
   const ref = p.preview[p.refIndex];
-  const lut = displayLut(ref.encoding);
-  const disp = new Uint16Array(ref.data.length);
-  for (let i = 0; i < disp.length; i++) disp[i] = lut[ref.data[i]] * 65535 + 0.5;
-  applyLook(p, look, disp);
-  p.referenceLook = lookKey(look);
   const rgba = new Uint8ClampedArray(ref.width * ref.height * 4);
-  toRGBA8(disp, DEFAULT_ADJUSTMENTS, rgba);
+  toRGBA8(toDisplay16(ref.data, ref.encoding), DEFAULT_ADJUSTMENTS, rgba);
   return rgba;
 }
 
@@ -518,19 +449,31 @@ function renderBase(views: View[], p: Prepared, params: RenderParams, model: Ton
   return out;
 }
 
-async function exportImage(
+/** 仕上げ調整の前の合成結果（表示用 16bit RGB） */
+interface Rendered {
+  display: Uint16Array;
+  width: number;
+  height: number;
+}
+
+/**
+ * 合成結果を書き出す大きさで作る。maxSide が 0 ならフル解像度。
+ * mergeLabel は合成している間の進み具合の表示
+ */
+async function renderFull(
   params: RenderParams,
-  opts: ExportOptions,
+  maxSide: number,
+  mergeLabel: string,
   progress: (label: string, f: number) => void,
-): Promise<{ blob: Blob; width: number; height: number }> {
+): Promise<Rendered> {
   const p = requirePrepared();
   ensureLayout(p);
   const model = params.mode === 'learned' ? await loadToneModel() : null;
   const { crop, width: W, height: H } = p;
-  const scaled = opts.maxSide > 0 && Math.max(crop.width, crop.height) > opts.maxSide;
-  const [tw, th] = scaled ? fitSize(crop.width, crop.height, opts.maxSide) : [crop.width, crop.height];
+  const scaled = maxSide > 0 && Math.max(crop.width, crop.height) > maxSide;
+  const [tw, th] = scaled ? fitSize(crop.width, crop.height, maxSide) : [crop.width, crop.height];
   // 位置合わせ済みのフレームを用意（整数の平行移動ならコピーせずにずらして参照する）
-  let views: View[] = p.entries.map((e, k) => {
+  const views: View[] = p.entries.map((e, k) => {
     progress('位置合わせを適用中', k / p.entries.length);
     const t = p.transforms[k];
     if (!scaled && isIntegerTranslation(t, 0.02, Math.max(W, H))) {
@@ -541,44 +484,44 @@ async function exportImage(
       : e.frame;
     return fullView(warp(src, W, H, t, crop, tw, th, true));
   });
-  const w = views[0].width;
-  const h = views[0].height;
-  let display: Uint16Array | null = renderBase(views, p, params, model, (f) => progress('書き出し用に合成中', f));
+  const display = renderBase(views, p, params, model, (f) => progress(mergeLabel, f));
   if (params.amount < 1) {
     const ref = views[p.refIndex];
     blendWithReference(display, ref, displayLut(ref.frame.encoding), params.amount);
   }
-  applyLook(p, params.look, display, display, lookJpegBase(params));
-  views = [];
-  progress('ファイルを作成中', 1);
+  return { display, width: views[0].width, height: views[0].height };
+}
 
-  const ref = p.entries[p.refIndex].exif;
-  const software = 'お手軽AEB合成';
-  if (opts.format === 'tiff') {
-    const rgb = new Uint16Array(display.length);
-    toRGB16(display, params.adjust, rgb);
-    display = null;
-    const blob = encodeTiff16(w, h, rgb, { software, make: ref.make, model: ref.model, dateTime: ref.dateTime });
-    return { blob, width: w, height: h };
-  }
-  const rgba = new Uint8ClampedArray(w * h * 4);
-  toRGBA8(display, params.adjust, rgba);
-  display = null;
-  const canvas = new OffscreenCanvas(w, h);
-  const g = canvas.getContext('2d');
-  if (!g) throw new Error('Canvas が使えません');
-  g.putImageData(new ImageData(rgba, w, h), 0, 0);
-  const type = opts.format === 'png' ? 'image/png' : 'image/jpeg';
-  let blob = await canvas.convertToBlob({ type, quality: opts.quality });
-  if (opts.format === 'jpeg') {
-    const app1 = buildExifApp1({
-      make: ref.make,
-      model: ref.model,
-      software,
-      dateTime: ref.dateTime ?? formatExifDate(new Date()),
-    });
-    const bytes = insertExif(new Uint8Array(await blob.arrayBuffer()), app1);
-    blob = new Blob([bytes as Uint8Array<ArrayBuffer>], { type });
-  }
-  return { blob, width: w, height: h };
+async function exportImage(
+  params: RenderParams,
+  opts: ExportOptions,
+  progress: (label: string, f: number) => void,
+): Promise<{ blob: Blob; width: number; height: number }> {
+  const p = requirePrepared();
+  let full: Rendered | null = await renderFull(params, opts.maxSide, '書き出し用に合成中', progress);
+  const { width, height } = full;
+  progress('ファイルを作成中', 1);
+  const pixels = finishPixels(full.display, params.adjust, opts.format);
+  full = null; // 合成結果のメモリを早めに手放す
+  const blob = await encodePixels(pixels, width, height, opts, p.entries[p.refIndex].exif);
+  return { blob, width, height };
+}
+
+/**
+ * 「Leica M10 の色」に渡すフル解像度の合成結果。色の変換は基準の写真（形式・機種・ホワイトバランス）に合わせる。
+ * おまかせは HDR+ の仕上がり（カメラ内 JPEG 並みのメリハリ）を学習しているので、その分だけ表示用の値を
+ * 「カメラ内 JPEG 並みのトーン」として戻す（効果の強さで基準フレームと混ぜた分は素の表示として戻す）
+ */
+async function mergedImage(params: RenderParams, progress: (label: string, f: number) => void): Promise<MergedImage> {
+  const p = requirePrepared();
+  const { display, width, height } = await renderFull(params, 0, 'フル解像度で合成中', progress);
+  const ref = p.entries[p.refIndex];
+  return {
+    width,
+    height,
+    data: display,
+    exif: ref.exif,
+    look: { encoding: ref.frame.encoding, make: ref.exif.make, model: ref.exif.model, neutral: ref.color?.neutral, camXyz: ref.color?.camXyz },
+    jpegBase: params.mode === 'learned' ? params.amount : 0,
+  };
 }
