@@ -138,10 +138,15 @@ export interface LeicaSourceInfo {
   cct?: number;
 }
 
+/**
+ * 写真はそれぞれの id で開いて、使い終わったら release で手放す。
+ * previewSide が 0 なら書き出しだけに使う（プレビューを作らない）
+ */
 export type ToLeicaWorker =
   | {
       type: 'openRaw';
       reqId: number;
+      id: string;
       width: number;
       height: number;
       data: Uint16Array;
@@ -149,12 +154,13 @@ export type ToLeicaWorker =
       color?: RawColor;
       previewSide: number;
     }
-  | { type: 'openFile'; reqId: number; file: File; previewSide: number }
-  | { type: 'openMerged'; reqId: number; image: MergedImage; previewSide: number }
-  /** 開いている写真を閉じてメモリを解放する */
-  | { type: 'close' }
-  | { type: 'render'; reqId: number; params: LeicaParams }
-  | { type: 'export'; reqId: number; params: LeicaParams; options: ExportOptions };
+  | { type: 'openFile'; reqId: number; id: string; file: File; previewSide: number }
+  | { type: 'openMerged'; reqId: number; id: string; image: MergedImage; previewSide: number }
+  /** 開いている写真を手放してメモリを解放する */
+  | { type: 'release'; id: string }
+  | { type: 'render'; reqId: number; id: string; params: LeicaParams }
+  /** crc が true なら、できたファイルの CRC-32 も返す（ZIP にまとめるため） */
+  | { type: 'export'; reqId: number; id: string; params: LeicaParams; options: ExportOptions; crc?: boolean };
 
 export type FromLeicaWorker =
   | { type: 'progress'; reqId: number; label: string; fraction: number }
@@ -170,5 +176,5 @@ export type FromLeicaWorker =
       before: Uint8ClampedArray;
       elapsed: number;
     }
-  | { type: 'exported'; reqId: number; blob: Blob; width: number; height: number; elapsed: number }
+  | { type: 'exported'; reqId: number; blob: Blob; width: number; height: number; elapsed: number; crc?: number }
   | { type: 'error'; reqId: number; message: string };

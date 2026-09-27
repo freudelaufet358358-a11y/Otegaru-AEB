@@ -463,6 +463,9 @@ body.dragging .stage {
   background: var(--accent-grad);
   transition: width 0.2s;
 }
+.busy-cancel {
+  margin-top: 0.9rem;
+}
 .spinner,
 .mini-spinner {
   display: inline-block;
@@ -573,8 +576,37 @@ body.dragging .stage {
   border-radius: 8px;
   padding: 0.35rem;
 }
-.file.reference {
+.file.reference,
+.file.selected {
   border-color: rgba(255, 138, 76, 0.55);
+}
+.file.selected {
+  background: #2b2f38;
+}
+/* 選んでプレビューする一覧（サムネイルと名前の部分がボタン） */
+.file-select {
+  grid-column: 1 / 3;
+  display: grid;
+  grid-template-columns: 56px 1fr;
+  gap: 0.6rem;
+  align-items: center;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  text-align: left;
+}
+.file-select:hover:not(:disabled) {
+  background: none;
+}
+.file-select:hover .file-name {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.file-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 .file.error {
   border-color: rgba(255, 107, 107, 0.55);
@@ -586,6 +618,15 @@ body.dragging .stage {
   object-fit: cover;
   background: #333842;
   display: block;
+}
+/* サムネイルがまだないとき（RAW は開くまで）は形式を出す */
+.thumb-empty {
+  display: grid;
+  place-items: center;
+  color: var(--text-dim);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
 }
 .file-meta {
   min-width: 0;

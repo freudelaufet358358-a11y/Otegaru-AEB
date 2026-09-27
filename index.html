@@ -6,7 +6,7 @@
     <title>お手軽AEB合成</title>
     <meta
       name="description"
-      content="オートブラケット（AEB）で撮った写真のHDR合成と、写真 1 枚からでも使える Leica M10 の色の再現をブラウザだけで。Canon EOS R6 Mark II の CR3 RAW にも対応。画像は外部に送信されません。"
+      content="オートブラケット（AEB）で撮った写真のHDR合成と、写真 1 枚からでも・まとめてでも使える Leica M10 の色の再現をブラウザだけで。Canon EOS R6 Mark II の CR3 RAW にも対応。画像は外部に送信されません。"
     />
     <meta name="color-scheme" content="dark" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
@@ -45,7 +45,7 @@
           </p>
           <button type="button" class="primary" id="pick-files">ファイルを選択</button>
           <p class="dropzone-alt">
-            1 枚の写真を Leica M10 の色にするときは
+            AEB なしで写真を Leica M10 の色にするときは
             <button type="button" class="link-button" data-goto="leica">「Leica M10 の色」タブへ</button>
           </p>
           <p class="privacy">🔒 画像はこの端末の中だけで処理され、どこにも送信されません</p>
@@ -228,7 +228,7 @@
           </svg>
           <p class="dropzone-title">Leica M10 の色にしたい写真をここにドロップ</p>
           <p class="dropzone-sub">
-            写真を 1 枚選んでください（AEB で撮っていない写真でも使えます）<br />
+            1 枚でも、何枚まとめてでも選べます（AEB で撮っていない写真でも使えます）<br />
             <strong>CR3（EOS R6 Mark II など）</strong>・CR2・NEF・ARW・DNG などの RAW、JPEG / PNG に対応
           </p>
           <button type="button" class="primary" id="leica-pick">ファイルを選択</button>
@@ -255,6 +255,7 @@
             <div class="spinner" aria-hidden="true"></div>
             <div class="busy-label">処理中…</div>
             <div class="bar"><div class="bar-fill"></div></div>
+            <button type="button" class="busy-cancel" id="leica-cancel" hidden>中止</button>
           </div>
         </div>
 
@@ -265,14 +266,15 @@
         </div>
       </section>
 
-      <aside class="panel">
+      <aside class="panel" id="leica-panel">
         <section class="card">
-          <h2><span class="step">1</span>写真</h2>
+          <h2><span class="step">1</span>写真 <span class="count" id="leica-count"></span></h2>
           <ul class="file-list" id="leica-source" data-empty="まだ写真がありません"></ul>
           <div class="row">
-            <button type="button" id="leica-open">写真を選ぶ</button>
+            <button type="button" id="leica-add">＋ 追加</button>
+            <button type="button" id="leica-clear" class="ghost">すべて削除</button>
           </div>
-          <p class="hint">RAW（CR3 など）でも JPEG でも使えます。1 枚ずつ仕上げます。</p>
+          <p class="hint">RAW（CR3 など）でも JPEG でも、何枚でもまとめて読み込めます。一覧で選んだ写真をプレビューします。</p>
         </section>
 
         <section class="card">
@@ -314,7 +316,9 @@
             </label>
           </div>
           <label class="slider" id="leica-quality-row"><span>JPEG 品質</span><input type="range" id="leica-export-quality" min="60" max="100" value="92" /><output></output></label>
+          <button type="button" class="primary wide" id="leica-export-all" hidden>まとめて保存</button>
           <button type="button" class="primary wide" id="leica-export" disabled>画像を保存</button>
+          <p class="hint" id="leica-batch-hint" hidden></p>
           <p class="hint" id="leica-export-hint"></p>
         </section>
       </aside>
@@ -335,10 +339,11 @@
         </ol>
         <h3>Leica M10 の色</h3>
         <ol>
-          <li>「Leica M10 の色」タブで写真を 1 枚ドロップ（またはファイルを選択）します。AEB で撮っていない写真でも、RAW（CR3 など）でも JPEG でも使えます。</li>
+          <li>「Leica M10 の色」タブに写真をドロップ（またはファイルを選択）します。1 枚でも何枚でも、AEB で撮っていない写真でも、RAW（CR3 など）でも JPEG でも使えます。一覧で選んだ写真をプレビューします。</li>
           <li>Leica M10 で撮ったような色（センサーの違いと Leica のカメラ内 JPEG の色づくり）になります。「Leica の効き」で強さを調整できます。</li>
-          <li>「階調も Leica のカメラ内 JPEG に合わせる」をオンにすると、明るさの付け方（暗部の沈み方・ハイライトのなだらかさ）も Leica の JPEG に合わせます。1 枚の写真ではオン、AEB の合成結果ではオフ（HDR 合成で起こした暗部を残す）が既定です。</li>
+          <li>「階調も Leica のカメラ内 JPEG に合わせる」をオンにすると、明るさの付け方（暗部の沈み方・ハイライトのなだらかさ）も Leica の JPEG に合わせます。写真ではオン、AEB の合成結果ではオフ（HDR 合成で起こした暗部を残す）が既定です。</li>
           <li>「比較」で標準の色と見比べ、仕上げを調整したら「画像を保存」。</li>
+          <li>何枚も読み込んだときは「まとめて保存」で、すべての写真を同じ設定で変換し、1 つの ZIP ファイルにまとめて保存できます（AEB の合成結果はそれぞれの設定で変換します）。</li>
         </ol>
         <h3>EOS R6 Mark II で撮るときのコツ</h3>
         <ul>
@@ -357,7 +362,7 @@
     </dialog>
 
     <input type="file" id="file-input" multiple hidden />
-    <input type="file" id="leica-file-input" hidden />
+    <input type="file" id="leica-file-input" multiple hidden />
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

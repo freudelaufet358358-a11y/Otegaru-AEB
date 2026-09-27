@@ -59,16 +59,38 @@ export function exposureText(e?: ExposureInfo): string {
   return exposureParts(e).join(' · ') || '露出情報なし';
 }
 
-/** 画像の一覧の 1 行（サムネイル・名前・説明・右端の表示と × ボタン）を li の中に作る */
+/**
+ * 画像の一覧の 1 行（サムネイル・名前・説明・右端の表示と × ボタン）を li の中に作る。
+ * サムネイルがまだないときは placeholder の文字（形式など）を出す。
+ * onSelect を渡すと、サムネイルと名前の部分がその行を選ぶボタンになる
+ */
 export function fillFileRow(
   li: HTMLLIElement,
-  row: { thumb?: string; name: string; sub: string; side?: HTMLElement[]; removeLabel: string; onRemove: () => void },
+  row: {
+    thumb?: string;
+    placeholder?: string;
+    name: string;
+    sub: string;
+    side?: HTMLElement[];
+    removeLabel: string;
+    onRemove: () => void;
+    onSelect?: () => void;
+    selected?: boolean;
+  },
 ): void {
   li.replaceChildren();
-  const img = document.createElement('img');
-  img.className = 'thumb';
-  img.alt = '';
-  if (row.thumb) img.src = row.thumb;
+  let img: HTMLElement;
+  if (row.thumb || !row.placeholder) {
+    const im = document.createElement('img');
+    im.className = 'thumb';
+    im.alt = '';
+    if (row.thumb) im.src = row.thumb;
+    img = im;
+  } else {
+    img = document.createElement('div');
+    img.className = 'thumb thumb-empty';
+    img.textContent = row.placeholder;
+  }
   const meta = document.createElement('div');
   meta.className = 'file-meta';
   const name = document.createElement('div');
@@ -89,7 +111,17 @@ export function fillFileRow(
   rm.setAttribute('aria-label', `${row.name} を${row.removeLabel}`);
   rm.onclick = row.onRemove;
   side.append(...(row.side ?? []), rm);
-  li.append(img, meta, side);
+  if (row.onSelect) {
+    const pick = document.createElement('button');
+    pick.type = 'button';
+    pick.className = 'file-select';
+    pick.setAttribute('aria-pressed', String(!!row.selected));
+    pick.onclick = row.onSelect;
+    pick.append(img, meta);
+    li.append(pick, side);
+  } else {
+    li.append(img, meta, side);
+  }
 }
 
 // ---------------------------------------------------------------------------

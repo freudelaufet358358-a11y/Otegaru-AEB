@@ -1,14 +1,24 @@
-// 「Leica M10 の色」のワーカー。写真 1 枚（または AEB の合成結果）を保持し、Leica M10 の色を掛けた
-// プレビューと書き出しを行う。
+// 「Leica M10 の色」のワーカー。開いた写真（または AEB の合成結果）を id ごとに保持し、Leica M10 の色を掛けた
+// プレビューと書き出しを行う。まとめて保存では、写真を 1 枚ずつ開いて書き出し、すぐに手放す。
 
 import { toRGBA8 } from '../core/adjust';
 import { toDisplay16 } from '../core/color';
 import type { ExposureInfo } from '../core/exif';
 import { fitSize, fullView, resizeView, type Frame16 } from '../core/frame';
 import { LeicaLook, parseLookModel, type LookParams, type LookSource } from '../core/look';
+import { crc32 } from '../core/zip';
 import lookModelJson from '../models/leica-m10.json';
 import { decodeImageFile, encodePixels, finishPixels } from './image-io';
 import type { ExportOptions, FromLeicaWorker, LeicaParams, ToLeicaWorker } from './protocol';
+
+interface Preview {
+  /** 縮小した表示用 16bit RGB（Leica M10 の色を掛ける前） */
+  data: Uint16Array;
+  width: number;
+  height: number;
+  /** 最後に Leica M10 の色を掛けたもの（仕上げ調整だけを変えたときに使い回す） */
+  cache: { key: string; display: Uint16Array } | null;
+}
 
 interface Source {
   /** 元の画像。RAW はリニア、JPEG などの写真と AEB の合成結果は表示用 (sRGB) の値 */
@@ -18,12 +28,8 @@ interface Source {
   look: LeicaLook;
   /** LeicaLook.toLinear の jpegBase（AEB の「おまかせ」の結果だけ 0 より大きい） */
   jpegBase: number;
-  /** プレビュー用に縮小した表示用 16bit RGB（Leica M10 の色を掛ける前） */
-  preview: Uint16Array;
-  previewWidth: number;
-  previewHeight: number;
-  /** 最後に Leica M10 の色を掛けたプレビュー（仕上げ調整だけを変えたときに使い回す） */
-  cache: { key: string; display: Uint16Array } | null;
+  /** 書き出しだけに開いたときは null */
+  preview: Preview | null;
 }
 
 const ctx = self as unknown as {
@@ -32,7 +38,7 @@ const ctx = self as unknown as {
 };
 
 const lookModel = parseLookModel(lookModelJson);
-let source: Source | null = null;
+const sources = new Map<string, Source>();
 
 const post = (msg: FromLeicaWorker, transfer: Transferable[] = []) => ctx.postMessage(msg, transfer);
 
@@ -55,78 +61,87 @@ ctx.onmessage = (ev) => {
 async function handle(msg: ToLeicaWorker): Promise<void> {
   switch (msg.type) {
     case 'openRaw': {
-      source = null;
+      sources.delete(msg.id);
       const frame: Frame16 = { width: msg.width, height: msg.height, data: msg.data, encoding: 'linear' };
-      const { exif } = msg;
-      open(msg.reqId, frame, exif, { encoding: 'linear', make: exif.make, model: exif.model, neutral: msg.color?.neutral, camXyz: msg.color?.camXyz }, 0, msg.previewSide);
+      const { exif, color } = msg;
+      const from: LookSource = { encoding: 'linear', make: exif.make, model: exif.model, neutral: color?.neutral, camXyz: color?.camXyz };
+      open(msg.reqId, msg.id, frame, exif, from, 0, msg.previewSide);
       break;
     }
     case 'openFile': {
-      source = null; // 先に手放して、読み込み中のメモリを減らす
+      sources.delete(msg.id); // 先に手放して、読み込み中のメモリを減らす
       const { frame, exif } = await decodeImageFile(msg.file);
-      open(msg.reqId, frame, exif, { encoding: 'srgb', make: exif.make, model: exif.model }, 0, msg.previewSide);
+      open(msg.reqId, msg.id, frame, exif, { encoding: 'srgb', make: exif.make, model: exif.model }, 0, msg.previewSide);
       break;
     }
     case 'openMerged': {
-      source = null;
+      sources.delete(msg.id);
       const m = msg.image;
       const frame: Frame16 = { width: m.width, height: m.height, data: m.data, encoding: 'srgb' };
-      open(msg.reqId, frame, m.exif, m.look, m.jpegBase, msg.previewSide);
+      open(msg.reqId, msg.id, frame, m.exif, m.look, m.jpegBase, msg.previewSide);
       break;
     }
-    case 'close':
-      source = null;
+    case 'release':
+      sources.delete(msg.id);
       break;
     case 'render': {
-      const s = requireSource();
+      const s = requireSource(msg.id);
+      const p = s.preview;
+      if (!p) throw new Error('プレビューを用意していない写真です');
       const t = performance.now();
       const key = lookKey(msg.params.look);
-      if (!s.cache || s.cache.key !== key) {
-        s.cache = { key, display: applyLook(s, msg.params.look, s.preview, new Uint16Array(s.preview.length)) };
+      if (!p.cache || p.cache.key !== key) {
+        p.cache = { key, display: applyLook(s, msg.params.look, p.data, new Uint16Array(p.data.length)) };
       }
-      const size = s.previewWidth * s.previewHeight * 4;
+      const size = p.width * p.height * 4;
       const rgba = new Uint8ClampedArray(size);
-      toRGBA8(s.cache.display, msg.params.adjust, rgba);
+      toRGBA8(p.cache.display, msg.params.adjust, rgba);
       const before = new Uint8ClampedArray(size);
-      toRGBA8(s.preview, msg.params.adjust, before);
+      toRGBA8(p.data, msg.params.adjust, before);
       post(
-        { type: 'rendered', reqId: msg.reqId, width: s.previewWidth, height: s.previewHeight, rgba, before, elapsed: performance.now() - t },
+        { type: 'rendered', reqId: msg.reqId, width: p.width, height: p.height, rgba, before, elapsed: performance.now() - t },
         [rgba.buffer, before.buffer],
       );
       break;
     }
     case 'export': {
       const t = performance.now();
-      const { blob, width, height } = await exportImage(msg.params, msg.options, (label, f) =>
+      const { blob, width, height } = await exportImage(requireSource(msg.id), msg.params, msg.options, (label, f) =>
         post({ type: 'progress', reqId: msg.reqId, label, fraction: f }),
       );
-      post({ type: 'exported', reqId: msg.reqId, blob, width, height, elapsed: performance.now() - t });
+      const crc = msg.crc ? crc32(new Uint8Array(await blob.arrayBuffer())) : undefined;
+      post({ type: 'exported', reqId: msg.reqId, blob, width, height, elapsed: performance.now() - t, crc });
       break;
     }
   }
 }
 
-function requireSource(): Source {
-  if (!source) throw new Error('先に写真を開いてください');
-  return source;
+function requireSource(id: string): Source {
+  const s = sources.get(id);
+  if (!s) throw new Error('先に写真を開いてください');
+  return s;
 }
 
-/** 写真を開く: プレビュー用に縮小し、出どころに合わせた Leica M10 の色を用意する */
-function open(reqId: number, frame: Frame16, exif: ExposureInfo, from: LookSource, jpegBase: number, previewSide: number): void {
-  const [pw, ph] = fitSize(frame.width, frame.height, previewSide);
-  const small = pw === frame.width && ph === frame.height ? null : resizeView(fullView(frame), pw, ph);
-  // 縮小したものは表示用に置き換えてよいが、元の画像はそのまま残す
-  const preview = small ? toDisplay16(small.data, small.encoding, small.data) : toDisplay16(frame.data, frame.encoding);
+/** 写真を開く: 出どころに合わせた Leica M10 の色を用意し、previewSide が 0 でなければプレビュー用に縮小する */
+function open(reqId: number, id: string, frame: Frame16, exif: ExposureInfo, from: LookSource, jpegBase: number, previewSide: number): void {
+  let preview: Preview | null = null;
+  if (previewSide > 0) {
+    const [pw, ph] = fitSize(frame.width, frame.height, previewSide);
+    const small = pw === frame.width && ph === frame.height ? null : resizeView(fullView(frame), pw, ph);
+    // 縮小したものは表示用に置き換えてよいが、元の画像はそのまま残す
+    const data = small ? toDisplay16(small.data, small.encoding, small.data) : toDisplay16(frame.data, frame.encoding);
+    preview = { data, width: pw, height: ph, cache: null };
+  }
   const look = new LeicaLook(lookModel, from);
-  source = { frame, exif, look, jpegBase, preview, previewWidth: pw, previewHeight: ph, cache: null };
+  sources.set(id, { frame, exif, look, jpegBase, preview });
   post({
     type: 'opened',
     reqId,
     info: {
       width: frame.width,
       height: frame.height,
-      previewWidth: pw,
-      previewHeight: ph,
+      previewWidth: preview?.width ?? 0,
+      previewHeight: preview?.height ?? 0,
       exif,
       jpeg: from.encoding === 'srgb',
       cameraMatched: look.cameraMatched,
@@ -145,11 +160,11 @@ function applyLook(s: Source, look: LookParams, src: Uint16Array, out: Uint16Arr
 }
 
 async function exportImage(
+  s: Source,
   params: LeicaParams,
   opts: ExportOptions,
   progress: (label: string, f: number) => void,
 ): Promise<{ blob: Blob; width: number; height: number }> {
-  const s = requireSource();
   const { frame } = s;
   const scaled = opts.maxSide > 0 && Math.max(frame.width, frame.height) > opts.maxSide;
   const [width, height] = scaled ? fitSize(frame.width, frame.height, opts.maxSide) : [frame.width, frame.height];
