@@ -30,6 +30,9 @@ python engine.py                # カメラ内 JPEG の仕上げ方（Leica / Ca
 python export_model.py ../../src/models/leica-m10.json --fixture ../../test/fixtures/leica.json
 cd ../.. && npm test            # TypeScript 実装（src/core/look.ts）が Python と一致するか確認
 
+# 変換の手順（apply_look）だけを直したときは、当てはめ直さずに基準データだけを作り直せる
+python export_model.py ../../src/models/leica-m10.json --from-json --fixture ../../test/fixtures/leica.json
+
 cd training/leica
 python report.py                # ドキュメントの表 → out/report.md
 python sheet.py ../../docs      # ドキュメントの比較画像

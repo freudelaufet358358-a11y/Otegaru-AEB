@@ -11,13 +11,32 @@
 //
 // 中間グレー（18%）は Leica のカメラ内 JPEG と同じ明るさ（sRGB 118.9）に合わせる。
 //
+// 当てはめに使った実写（Leica は庭、Canon は素焼きの置物）には青空のような明るく鮮やかな青がないので、
+// その外側で行き過ぎないよう 2 つの手当てをする:
+//  - 白飛びした値はトーンカーブの逆を白の点で止める（カーブの肩は平らなので、そのまま戻すと何段も跳ね上がり、
+//    行列で他のチャンネルが負になって真っ青緑になる）
+//  - R・G・B に同じトーンカーブを別々に掛けると、明るく鮮やかな色では一番明るいチャンネルだけが肩で圧縮されて
+//    色相がずれる（青空が水色〜青緑になる）。最大のチャンネルが中間グレーの 1〜2.5 段上にかけて、
+//    色相をカーブを掛ける前の色相に戻していく（中間調の色はそのまま）
+//
 // tone が 0 なら明るさ（輝度）は元の画像のまま残し、色相・彩度だけを Leica のカメラ内 JPEG に合わせる。
 // Leica の JPEG のトーンカーブは暗部を深く沈める（中間グレーの 4 段下で sRGB 8 程度）ので、そのまま掛けると
 // HDR 合成で起こした暗部がまたつぶれてしまうため（アプリでは AEB の合成結果の既定）。
 // tone を 1 にするとトーンカーブも Leica のものにする（アプリでは 1 枚の写真の既定）。
 // 数式は training/leica/export_model.py の apply_look と 1 対 1 に対応させている。
 
-import { fastLinearToSrgb, linearLut, linearToSrgb, LUMA_B, LUMA_G, LUMA_R, shoulderInverse, srgbToLinear, type Encoding } from './color';
+import {
+  fastLinearToSrgb,
+  linearLut,
+  linearToSrgb,
+  LUMA_B,
+  LUMA_G,
+  LUMA_R,
+  RAW_DISPLAY_GAIN,
+  shoulderInverse,
+  srgbToLinear,
+  type Encoding,
+} from './color';
 
 export interface LookParams {
   /** 効き 0..1（0 で元のまま） */
@@ -66,6 +85,15 @@ export interface LookSource {
 
 /** 中間グレー（18%）の、カメラ内 JPEG での値 */
 const MID_GREY = 118.9 / 255;
+/** カメラ内 JPEG でこれ以上の値は白飛びとみなす（トーンカーブの逆をここで止める） */
+const WHITE = 0.995;
+/** 最大のチャンネルが中間グレーの何段上から何段上までで、色相を保つ割合を 0 → 1 にするか */
+const HUE_EV: [number, number] = [1, 2.5];
+
+function smoothstep(t: number): number {
+  const c = t < 0 ? 0 : t > 1 ? 1 : t;
+  return c * c * (3 - 2 * c);
+}
 
 function mat(a: ArrayLike<number>): Mat3 {
   if (a.length !== 9) throw new Error('色の行列は 9 要素です');
@@ -215,9 +243,13 @@ export class LeicaLook {
   private readonly encoding: Encoding;
   /** Canon のカメラ内 JPEG の中間グレーのリニア値（0.18 にそろえるため） */
   private readonly canonMid: number;
+  /** Canon のカメラ内 JPEG が白（WHITE）に届くリニア値 */
+  private readonly canonWhite: number;
+  /** Leica のトーンカーブの入力で、中間グレーになる値 */
+  private readonly leicaMid: number;
   private inLut: { jpegBase: number; lut: Float32Array } | null = null;
-  /** Leica のトーンカーブ（sRGB 符号値）と、それをリニアにしたもの */
-  private outLut: { encoded: Float32Array; linear: Float32Array } | null = null;
+  /** Leica のトーンカーブ（sRGB 符号値）と、それをリニアにしたもの、明るさごとの色相を保つ割合 */
+  private outLut: { encoded: Float32Array; linear: Float32Array; hue: Float32Array } | null = null;
   private readonly vMax: number;
 
   constructor(
@@ -235,10 +267,12 @@ export class LeicaLook {
       if (!inv) throw new Error('色の行列が正しくありません');
       m = mul3(m, inv);
     }
-    const scale = curveInverse(leica.curve, curveDomain, MID_GREY) / 0.18;
+    this.leicaMid = curveInverse(leica.curve, curveDomain, MID_GREY);
+    const scale = this.leicaMid / 0.18;
     for (let i = 0; i < 9; i++) m[i] *= scale;
     this.matrix = m;
     this.canonMid = curveInverse(canon.curve, curveDomain, MID_GREY);
+    this.canonWhite = curveInverse(canon.curve, curveDomain, WHITE);
     this.vMax = Math.pow(2, curveDomain[1]);
   }
 
@@ -250,10 +284,17 @@ export class LeicaLook {
    * - JPEG などの写真: Canon のピクチャースタイル「スタンダード」のトーンカーブの逆（色の行列の逆は matrix に含む）
    */
   toLinear(d: number, jpegBase = 0): number {
-    const jpeg = () => (curveInverse(this.model.canon.curve, this.model.curveDomain, Math.min(1, Math.max(0, d))) * 0.18) / this.canonMid;
+    const { canon, curveDomain } = this.model;
+    // 白飛びした値は白の点で止める（RAW は白飛びした画素の値 = RAW_DISPLAY_GAIN）
+    const jpeg = () => (Math.min(curveInverse(canon.curve, curveDomain, Math.min(1, Math.max(0, d))), this.canonWhite) * 0.18) / this.canonMid;
     if (this.encoding === 'srgb') return jpeg();
-    const x = shoulderInverse(srgbToLinear(d));
+    const x = Math.min(shoulderInverse(srgbToLinear(d)), RAW_DISPLAY_GAIN);
     return jpegBase > 0 ? x + (jpeg() - x) * Math.min(1, jpegBase) : x;
+  }
+
+  /** 色相をカーブを掛ける前の色相に戻す割合（トーンカーブの入力の最大のチャンネル ymax から） */
+  hueWeight(ymax: number): number {
+    return smoothstep((Math.log2(Math.max(ymax, 1e-30) / this.leicaMid) - HUE_EV[0]) / (HUE_EV[1] - HUE_EV[0]));
   }
 
   /**
@@ -267,17 +308,21 @@ export class LeicaLook {
     const m = this.matrix;
     const { curve } = this.model.leica;
     const dom = this.model.curveDomain;
-    const o0 = curveEval(curve, dom, m[0] * x0 + m[1] * x1 + m[2] * x2);
-    const o1 = curveEval(curve, dom, m[3] * x0 + m[4] * x1 + m[5] * x2);
-    const o2 = curveEval(curve, dom, m[6] * x0 + m[7] * x1 + m[8] * x2);
+    const y0 = m[0] * x0 + m[1] * x1 + m[2] * x2;
+    const y1 = m[3] * x0 + m[4] * x1 + m[5] * x2;
+    const y2 = m[6] * x0 + m[7] * x1 + m[8] * x2;
+    const o = [curveEval(curve, dom, y0), curveEval(curve, dom, y1), curveEval(curve, dom, y2)];
+    const l = Float64Array.from(o, srgbToLinear);
+    const mid = keepHue(y0, y1, y2, l, this.hueWeight(Math.max(y0, y1, y2)));
+    if (mid >= 0) o[mid] = linearToSrgb(l[mid]);
     const yi = LUMA_R * srgbToLinear(r) + LUMA_G * srgbToLinear(g) + LUMA_B * srgbToLinear(b);
-    keepLuminance(srgbToLinear(o0), srgbToLinear(o1), srgbToLinear(o2), yi, out, linearToSrgb);
-    out[0] += (o0 - out[0]) * tone;
-    out[1] += (o1 - out[1]) * tone;
-    out[2] += (o2 - out[2]) * tone;
+    keepLuminance(l[0], l[1], l[2], yi, out, linearToSrgb);
+    out[0] += (o[0] - out[0]) * tone;
+    out[1] += (o[1] - out[1]) * tone;
+    out[2] += (o[2] - out[2]) * tone;
   }
 
-  private tables(jpegBase: number): { inLut: Float32Array; encoded: Float32Array; linear: Float32Array } {
+  private tables(jpegBase: number): { inLut: Float32Array; encoded: Float32Array; linear: Float32Array; hue: Float32Array } {
     if (!this.inLut || this.inLut.jpegBase !== jpegBase) {
       const lut = new Float32Array(65536);
       for (let i = 0; i < 65536; i++) lut[i] = this.toLinear(i / 65535, jpegBase);
@@ -286,13 +331,16 @@ export class LeicaLook {
     if (!this.outLut) {
       const encoded = new Float32Array(OUT_SIZE + 1);
       const linear = new Float32Array(OUT_SIZE + 1);
+      const hue = new Float32Array(OUT_SIZE + 1);
       const { curve } = this.model.leica;
       for (let i = 0; i <= OUT_SIZE; i++) {
         const u = i / OUT_SIZE;
-        encoded[i] = curveEval(curve, this.model.curveDomain, u * u * this.vMax);
+        const v = u * u * this.vMax;
+        encoded[i] = curveEval(curve, this.model.curveDomain, v);
         linear[i] = srgbToLinear(encoded[i]);
+        hue[i] = this.hueWeight(v);
       }
-      this.outLut = { encoded, linear };
+      this.outLut = { encoded, linear, hue };
     }
     return { inLut: this.inLut.lut, ...this.outLut };
   }
@@ -307,19 +355,21 @@ export class LeicaLook {
       if (out !== src) out.set(src);
       return out;
     }
-    const { inLut, encoded, linear } = this.tables(Math.round(Math.min(1, Math.max(0, jpegBase)) * 100) / 100);
+    const { inLut, encoded, linear, hue } = this.tables(Math.round(Math.min(1, Math.max(0, jpegBase)) * 100) / 100);
     const srgb = linearLut('srgb');
     const t = Math.min(1, Math.max(0, tone));
     const m = this.matrix;
     const scale = OUT_SIZE / Math.sqrt(this.vMax);
-    const lookup = (table: Float32Array, x: number): number => {
-      if (!(x > 0)) return table[0];
-      const f = Math.sqrt(x) * scale;
+    // トーンカーブの入力 → 表の位置（平方根で添字を取る）。同じ位置で符号値・リニア・色相を保つ割合の表を引く
+    const pos = (x: number): number => (x > 0 ? Math.sqrt(x) * scale : 0);
+    const at = (table: Float32Array, f: number): number => {
       if (f >= OUT_SIZE) return table[OUT_SIZE];
       const i = f | 0;
       return table[i] + (table[i + 1] - table[i]) * (f - i);
     };
     const q = new Float64Array(3);
+    const l = new Float64Array(3);
+    const e = new Float64Array(3);
     for (let i = 0; i < src.length; i += 3) {
       const r = src[i];
       const g = src[i + 1];
@@ -330,24 +380,42 @@ export class LeicaLook {
       const y0 = m[0] * x0 + m[1] * x1 + m[2] * x2;
       const y1 = m[3] * x0 + m[4] * x1 + m[5] * x2;
       const y2 = m[6] * x0 + m[7] * x1 + m[8] * x2;
+      const f0 = pos(y0);
+      const f1 = pos(y1);
+      const f2 = pos(y2);
+      // 明るいところだけ、色相をカーブを掛ける前の色相に戻す（中間調より暗いところは w = 0）
+      const w = at(hue, f0 > f1 ? (f0 > f2 ? f0 : f2) : f1 > f2 ? f1 : f2);
+      let mid = -1;
+      if (t < 1 || w > 0) {
+        l[0] = at(linear, f0);
+        l[1] = at(linear, f1);
+        l[2] = at(linear, f2);
+        mid = keepHue(y0, y1, y2, l, w);
+      }
+      if (t > 0) {
+        e[0] = at(encoded, f0);
+        e[1] = at(encoded, f1);
+        e[2] = at(encoded, f2);
+        if (mid >= 0) e[mid] = fastLinearToSrgb(l[mid]);
+      }
       let o0: number;
       let o1: number;
       let o2: number;
       if (t < 1) {
         const yi = LUMA_R * srgb[r] + LUMA_G * srgb[g] + LUMA_B * srgb[b];
-        keepLuminance(lookup(linear, y0), lookup(linear, y1), lookup(linear, y2), yi, q, fastLinearToSrgb);
+        keepLuminance(l[0], l[1], l[2], yi, q, fastLinearToSrgb);
         o0 = q[0];
         o1 = q[1];
         o2 = q[2];
         if (t > 0) {
-          o0 += (lookup(encoded, y0) - o0) * t;
-          o1 += (lookup(encoded, y1) - o1) * t;
-          o2 += (lookup(encoded, y2) - o2) * t;
+          o0 += (e[0] - o0) * t;
+          o1 += (e[1] - o1) * t;
+          o2 += (e[2] - o2) * t;
         }
       } else {
-        o0 = lookup(encoded, y0);
-        o1 = lookup(encoded, y1);
-        o2 = lookup(encoded, y2);
+        o0 = e[0];
+        o1 = e[1];
+        o2 = e[2];
       }
       out[i] = r + (o0 * 65535 - r) * k + 0.5;
       out[i + 1] = g + (o1 * 65535 - g) * k + 0.5;
@@ -355,6 +423,39 @@ export class LeicaLook {
     }
     return out;
   }
+}
+
+/**
+ * 明るいところの色相を、トーンカーブを掛ける前（y）の色相に戻す（training/leica/export_model.py の keep_hue_in_highlights）。
+ * l は光の強さ（リニア）の出力。最大・最小のチャンネルはそのままに、中間のチャンネルを y と同じ比
+ * （(中 - 小) / (大 - 小)）へ w の割合で寄せる。書き換えたチャンネルの番号を返す（書き換えなければ -1）
+ */
+function keepHue(y0: number, y1: number, y2: number, l: Float64Array, w: number): number {
+  if (!(w > 0)) return -1;
+  // 小・中・大の順に並べる（同じ値は番号の順のまま = numpy の安定ソートと同じ）。画素ごとに呼ぶので配列を作らない
+  let lo = 0;
+  let mid = 1;
+  let hi = 2;
+  let a = y0 > 0 ? y0 : 0;
+  let b = y1 > 0 ? y1 : 0;
+  let c = y2 > 0 ? y2 : 0;
+  let s: number;
+  if (a > b) {
+    s = a; a = b; b = s;
+    s = lo; lo = mid; mid = s;
+  }
+  if (b > c) {
+    s = b; b = c; c = s;
+    s = mid; mid = hi; hi = s;
+  }
+  if (a > b) {
+    s = a; a = b; b = s;
+    s = lo; lo = mid; mid = s;
+  }
+  const span = c - a;
+  const r = span > 1e-12 ? (b - a) / span : 0;
+  l[mid] += (l[lo] + r * (l[hi] - l[lo]) - l[mid]) * w;
+  return mid;
 }
 
 /**

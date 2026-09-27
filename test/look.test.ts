@@ -12,6 +12,22 @@ const fixture = JSON.parse(fixtureText) as {
   cases: Array<{ encoding: 'linear' | 'srgb'; camera: string; cct: number | null; jpeg_base: number; tone: number; out: number[] }>;
 };
 
+/** sRGB 符号値 (0..1) の Oklab での色相 [度] */
+function oklabHue(c: ArrayLike<number>): number {
+  const [r, g, b] = [c[0], c[1], c[2]].map((v) => srgbToLinear(Math.min(1, Math.max(0, v))));
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  const a = 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s;
+  const bb = 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s;
+  return (Math.atan2(bb, a) * 180) / Math.PI;
+}
+
+/** 色相の差（-180..180） */
+function hueDiff(a: number, b: number): number {
+  return ((((a - b) % 360) + 540) % 360) - 180;
+}
+
 /** 基準データの機種キーになる make / model */
 const CAMERAS: Record<string, { make: string; model: string }> = {
   'canon:r6m2': { make: 'Canon', model: 'Canon EOS R6m2' },
@@ -118,6 +134,62 @@ describe('Leica M10 の色', () => {
       look.pixel(v, v, v, a, 0, 1);
       look.pixel(v, v, v, b, 1, 1);
       expect(Math.abs(b[1] - v)).toBeLessThan(Math.abs(a[1] - v));
+    }
+  });
+
+  it('明るく鮮やかな青空が、水色・青緑に振れない（色相の回りは Leica と Canon の違いの範囲）', () => {
+    // 青空の色（青が白飛びしたものも）。Oklab の色相で比べる。
+    // Leica は Canon より青をやや水色寄りに写す（行列だけで -12〜-17°）ので、その分と中間調の上のほうに残るずれは許す。
+    // 直す前は -28〜-56°（赤が 0 に張り付いた青緑）だった
+    const skies = [
+      [85, 130, 205],
+      [88, 143, 225],
+      [98, 157, 240],
+      [140, 189, 255],
+    ];
+    const out = [0, 0, 0];
+    for (const [encoding, tone] of [
+      ['srgb', 0],
+      ['srgb', 1],
+      ['linear', 0],
+      ['linear', 1],
+    ] as const) {
+      const look = new LeicaLook(model, { encoding, make: 'Canon', model: 'Canon EOS R6m2', cct: encoding === 'linear' ? 5500 : undefined });
+      for (const c of skies) {
+        const [r, g, b] = c.map((v) => v / 255);
+        look.pixel(r, g, b, out, 0, tone);
+        const dh = hueDiff(oklabHue(out), oklabHue([r, g, b]));
+        expect(dh, `${encoding} tone=${tone} ${c} → ${out.map((v) => Math.round(v * 255))}`).toBeGreaterThan(-26);
+        expect(dh).toBeLessThan(2);
+        // 赤が 0 に張り付いた青緑（行列で負になったものを切り捨てた色）にならない
+        expect(out[0]).toBeGreaterThan(0.1);
+      }
+    }
+  });
+
+  it('白飛びした値でトーンカーブの逆が跳ね上がらず、中間調では色相を戻す処理が働かない', () => {
+    const jpeg = new LeicaLook(model, { encoding: 'srgb', make: 'Canon', model: 'Canon EOS R6m2' });
+    // JPEG: 白の点（0.995）より上はすべて同じ値
+    expect(jpeg.toLinear(1)).toBeCloseTo(jpeg.toLinear(0.995), 9);
+    expect(jpeg.toLinear(1)).toBeLessThan(1.4);
+    expect(jpeg.toLinear(0.99)).toBeLessThan(jpeg.toLinear(0.995));
+    // RAW: 白飛びした画素の値（RAW_DISPLAY_GAIN）で止める
+    const raw = new LeicaLook(model, { encoding: 'linear', make: 'Canon', model: 'Canon EOS R6m2', cct: 5500 });
+    expect(raw.toLinear(1)).toBeCloseTo(Math.SQRT2, 9);
+    // 色相を戻す割合: 中間グレーの 1 段上までは 0、2.5 段上から 1、その間は単調に増える
+    const mid = raw.matrix[0] + raw.matrix[1] + raw.matrix[2]; // 中間グレー 0.18 の入力 → トーンカーブの入力
+    const at = (ev: number) => raw.hueWeight(mid * 0.18 * Math.pow(2, ev));
+    expect(at(-3)).toBe(0);
+    expect(at(0)).toBe(0);
+    expect(at(0.95)).toBe(0);
+    expect(at(1.05)).toBeGreaterThan(0);
+    expect(at(2.45)).toBeLessThan(1);
+    expect(at(2.55)).toBe(1);
+    expect(at(4)).toBe(1);
+    let prev = 0;
+    for (let ev = 0.9; ev <= 2.6; ev += 0.1) {
+      expect(at(ev)).toBeGreaterThanOrEqual(prev);
+      prev = at(ev);
     }
   });
 
