@@ -7,7 +7,9 @@ import { buildExifApp1, exposureValue, formatExifDate, insertExif, readExif, typ
 import { fitSize, fullView, resizeView, rowIndex, type Frame16, type View } from '../core/frame';
 import { exposureFusion, type ProgressFn } from '../core/fusion';
 import { estimateExposures, toneMapHDR } from '../core/hdr';
+import { parseToneModel, predictGrid, radianceThumbnail, renderLearned, type ToneGrid, type ToneModel } from '../core/learned';
 import { encodeTiff16 } from '../core/tiff';
+import modelUrl from '../models/tone-hdrplus.bin?url';
 import {
   angleDegrees,
   apply,
@@ -57,6 +59,8 @@ interface Prepared {
   previewSrc: Frame16[]; // プレビュー用に縮小した元フレーム（ワープ前）
   preview: Frame16[]; // 位置合わせ済みのプレビュー用フレーム
   layoutDirty: boolean;
+  /** おまかせモードのグリッド（プレビュー用フレームから求め、書き出しでも同じものを使う） */
+  toneGrid: ToneGrid | null;
 }
 
 const NO_MANUAL: ManualAdjust = { x: 0, y: 0, rotation: 0 };
@@ -142,8 +146,9 @@ async function handle(msg: ToWorker): Promise<void> {
       }
       const key = baseKey(msg.params);
       if (!cache || cache.key !== key) {
+        const model = msg.params.mode === 'learned' ? await loadToneModel() : null;
         const views = p.preview.map(fullView);
-        const display = renderBase(views, p, msg.params, (f) => post({ type: 'progress', reqId: msg.reqId, label: '合成中', fraction: f }));
+        const display = renderBase(views, p, msg.params, model, (f) => post({ type: 'progress', reqId: msg.reqId, label: '合成中', fraction: f }));
         cache = { key, display, width: views[0].width, height: views[0].height };
       }
       let display = cache.display;
@@ -287,6 +292,7 @@ function prepare(align: boolean, previewSide: number, progress: (label: string, 
     previewSrc: [],
     preview: [],
     layoutDirty: true,
+    toneGrid: null,
   };
   updateTransforms(p);
 
@@ -330,6 +336,7 @@ function ensureLayout(p: Prepared): void {
   p.crop = crop;
   p.preview = p.previewSrc.map((src, k) => warp(src, p.width, p.height, p.transforms[k], crop, pw, ph, false));
   p.layoutDirty = false;
+  p.toneGrid = null;
   cache = null;
   const cx = (p.width - 1) / 2;
   const cy = (p.height - 1) / 2;
@@ -399,15 +406,48 @@ function loupe(p: Prepared, id: string, cx: number, cy: number, size: number, mo
 }
 
 function baseKey(p: RenderParams): string {
-  return p.mode === 'fusion' ? `f:${JSON.stringify(p.fusion)}` : `h:${JSON.stringify(p.tone)}`;
+  if (p.mode === 'fusion') return `f:${JSON.stringify(p.fusion)}`;
+  if (p.mode === 'learned') return `l:${JSON.stringify(p.learned)}`;
+  return `h:${JSON.stringify(p.tone)}`;
+}
+
+let modelPromise: Promise<ToneModel> | null = null;
+
+/** 学習済みモデルを読み込む（初めて使うときに 1 回だけ） */
+function loadToneModel(): Promise<ToneModel> {
+  modelPromise ??= fetch(modelUrl)
+    .then(async (res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return parseToneModel(await res.arrayBuffer());
+    })
+    .catch((e: unknown) => {
+      modelPromise = null;
+      throw new Error(`学習済みモデルを読み込めませんでした（${e instanceof Error ? e.message : String(e)}）`);
+    });
+  return modelPromise;
+}
+
+/** おまかせモードのグリッド。プレビュー用フレームの放射輝度から 1 回だけ求める */
+function ensureToneGrid(p: Prepared, model: ToneModel): ToneGrid {
+  if (!p.toneGrid) {
+    const views = p.preview.map(fullView);
+    const luts = views.map((v) => linearLut(v.frame.encoding));
+    p.toneGrid = predictGrid(model, radianceThumbnail(views, luts, p.exposures, model.low));
+  }
+  return p.toneGrid;
 }
 
 /** 仕上げ調整前の合成結果（表示用 16bit RGB）を作る */
-function renderBase(views: View[], p: Prepared, params: RenderParams, progress: ProgressFn): Uint16Array {
+function renderBase(views: View[], p: Prepared, params: RenderParams, model: ToneModel | null, progress: ProgressFn): Uint16Array {
   const w = views[0].width;
   const h = views[0].height;
   const out = new Uint16Array(w * h * 3);
-  if (params.mode === 'fusion') {
+  if (params.mode === 'learned') {
+    if (!model) throw new Error('学習済みモデルが読み込まれていません');
+    const tg = ensureToneGrid(p, model);
+    const luts = views.map((v) => linearLut(v.frame.encoding));
+    renderLearned(views, luts, p.exposures, model, tg, params.learned, out, progress);
+  } else if (params.mode === 'fusion') {
     const luts = views.map((v) => displayLut(v.frame.encoding));
     exposureFusion(
       views,
@@ -435,6 +475,7 @@ async function exportImage(
 ): Promise<{ blob: Blob; width: number; height: number }> {
   const p = requirePrepared();
   ensureLayout(p);
+  const model = params.mode === 'learned' ? await loadToneModel() : null;
   const { crop, width: W, height: H } = p;
   const scaled = opts.maxSide > 0 && Math.max(crop.width, crop.height) > opts.maxSide;
   const [tw, th] = scaled ? fitSize(crop.width, crop.height, opts.maxSide) : [crop.width, crop.height];
@@ -452,7 +493,7 @@ async function exportImage(
   });
   const w = views[0].width;
   const h = views[0].height;
-  let display: Uint16Array | null = renderBase(views, p, params, (f) => progress('書き出し用に合成中', f));
+  let display: Uint16Array | null = renderBase(views, p, params, model, (f) => progress('書き出し用に合成中', f));
   if (params.amount < 1) {
     const ref = views[p.refIndex];
     blendWithReference(display, ref, displayLut(ref.frame.encoding), params.amount);

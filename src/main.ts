@@ -51,9 +51,13 @@ const el = {
 };
 
 const MODE_HINTS: Record<Mode, string> = {
-  fusion: '各写真の「ちょうど良く写っている部分」を自然につなぎ合わせます。迷ったらこちら。',
+  learned:
+    '約 3,500 シーンの写真（RAW と仕上がった写真の組）で学習したモデルが、明るさ・メリハリ・色のバランスを写真らしく整えます。迷ったらこちら。',
+  fusion: '各写真の「ちょうど良く写っている部分」をそのままつなぎ合わせます。',
   hdr: '露出の違いから広い明暗差を再現し、暗部と明部をしっかり起こした HDR 調に仕上げます（RAW 向け）。',
 };
+
+const MODE_NAMES: Record<Mode, string> = { learned: 'おまかせ', fusion: 'ナチュラル', hdr: 'HDR' };
 
 // ---------------------------------------------------------------------------
 // 合成ワーカーとの通信
@@ -441,7 +445,7 @@ async function renderOnce(gen: number, showProgress: boolean): Promise<void> {
     el.info.textContent = [
       `${prepared.width}×${prepared.height}`,
       `${prepared.order.length}枚`,
-      params.mode === 'fusion' ? 'ナチュラル' : 'HDR',
+      MODE_NAMES[params.mode],
       !prepared.aligned ? '位置合わせオフ' : shift < 0.05 && rotation < 0.005 ? 'ずれなし' : `位置補正 ${shift.toFixed(1)}px・${rotation.toFixed(2)}°`,
     ].join(' · ');
   } catch (e) {
@@ -494,10 +498,11 @@ function hideBusy(): void {
 // ---------------------------------------------------------------------------
 // パラメータ
 
-let mode: Mode = 'fusion';
+let mode: Mode = 'learned';
 
 const sliders = {
   amount: $<HTMLInputElement>('amount'),
+  learnedExposure: $<HTMLInputElement>('learned-exposure'),
   fusionDetail: $<HTMLInputElement>('fusion-detail'),
   toneStrength: $<HTMLInputElement>('tone-strength'),
   toneDetail: $<HTMLInputElement>('tone-detail'),
@@ -513,6 +518,7 @@ const sliders = {
 
 const formats: Partial<Record<keyof typeof sliders, (v: number) => string>> = {
   amount: (v) => `${v}%`,
+  learnedExposure: (v) => formatEv(v / 10),
   fusionDetail: (v) => `${(v / 100).toFixed(2)}×`,
   toneDetail: (v) => `${(v / 100).toFixed(2)}×`,
   wCenter: (v) => (v / 100).toFixed(2),
@@ -541,6 +547,7 @@ function currentParams(): RenderParams {
       detail: num(sliders.fusionDetail) / 100,
     },
     tone: { strength: num(sliders.toneStrength) / 100, detail: num(sliders.toneDetail) / 100 },
+    learned: { exposure: num(sliders.learnedExposure) / 10 },
     adjust: {
       brightness: num(sliders.brightness),
       contrast: num(sliders.contrast),
@@ -954,7 +961,7 @@ function bindEvents(): void {
 async function init(): Promise<void> {
   bindEvents();
   updateOutputs();
-  setMode('fusion');
+  setMode('learned');
   updateExportState();
   const isolated = await ensureCrossOriginIsolation();
   if (!isolated) {

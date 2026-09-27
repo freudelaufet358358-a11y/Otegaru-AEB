@@ -4,3 +4,9 @@ public/vendor/
 *.log
 .DS_Store
 test-results/
+# 学習用のデータ・途中経過（training/README.md 参照）
+training/data/
+training/runs/
+training/eval/scenes/
+training/eval/out/
+__pycache__/

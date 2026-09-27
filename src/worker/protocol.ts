@@ -4,8 +4,10 @@ import type { Adjustments } from '../core/adjust';
 import type { ExposureInfo } from '../core/exif';
 import type { FusionWeights } from '../core/fusion';
 import type { ToneParams } from '../core/hdr';
+import type { LearnedParams } from '../core/learned';
 
-export type Mode = 'fusion' | 'hdr';
+/** learned: 学習済みモデル（おまかせ）、fusion: 露出フュージョン（ナチュラル）、hdr: トーンマッピング */
+export type Mode = 'learned' | 'fusion' | 'hdr';
 
 export interface RenderParams {
   mode: Mode;
@@ -13,6 +15,7 @@ export interface RenderParams {
   amount: number;
   fusion: FusionWeights;
   tone: ToneParams;
+  learned: LearnedParams;
   adjust: Adjustments;
 }
 

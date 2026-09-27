@@ -95,14 +95,15 @@ export function resizeView(v: View, tw: number, th: number): Frame16 {
   return { width: tw, height: th, data: out, encoding: v.frame.encoding };
 }
 
-interface AreaWeights {
+export interface AreaWeights {
   start: Int32Array;
   count: Int32Array;
   offset: Int32Array;
   weights: Float32Array;
 }
 
-function buildAreaWeights(src: number, dst: number): AreaWeights {
+/** 面積平均で src → dst 画素に縮小するときの重み（出力画素ごとの入力範囲と被覆率） */
+export function buildAreaWeights(src: number, dst: number): AreaWeights {
   const scale = src / dst;
   const start = new Int32Array(dst);
   const count = new Int32Array(dst);

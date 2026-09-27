@@ -8,6 +8,8 @@ const isolationHeaders = {
 
 export default defineConfig({
   base: './',
+  // 学習済みモデルの重み（src/models/*.bin）をアセットとして扱う
+  assetsInclude: ['**/*.bin'],
   server: { headers: isolationHeaders },
   preview: { headers: isolationHeaders },
   worker: { format: 'es' },

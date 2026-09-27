@@ -92,17 +92,23 @@
         <section class="card">
           <h2><span class="step">2</span>合成</h2>
           <div class="segmented" role="radiogroup" aria-label="合成方式">
-            <button type="button" role="radio" data-mode="fusion" aria-checked="true">
-              ナチュラル<small>露出フュージョン</small>
+            <button type="button" role="radio" data-mode="learned" aria-checked="true">
+              おまかせ<small>学習モデル</small>
+            </button>
+            <button type="button" role="radio" data-mode="fusion" aria-checked="false">
+              ナチュラル<small>フュージョン</small>
             </button>
             <button type="button" role="radio" data-mode="hdr" aria-checked="false">
-              HDR<small>トーンマッピング</small>
+              HDR<small>トーンマップ</small>
             </button>
           </div>
           <p class="hint" id="mode-hint"></p>
           <label class="slider"><span>効果の強さ</span><input type="range" id="amount" min="0" max="100" value="100" /><output></output></label>
 
-          <div class="mode-params" data-for="fusion">
+          <div class="mode-params" data-for="learned">
+            <label class="slider"><span>明るさ補正</span><input type="range" id="learned-exposure" min="-20" max="20" value="0" /><output></output></label>
+          </div>
+          <div class="mode-params" data-for="fusion" hidden>
             <label class="slider"><span>ディテール（立体感）</span><input type="range" id="fusion-detail" min="50" max="250" value="100" /><output></output></label>
             <details>
               <summary>詳細設定</summary>
@@ -203,7 +209,7 @@
         <ol>
           <li>カメラの AEB（オートブラケット）で、露出を変えて撮った写真を 2〜9 枚用意します。</li>
           <li>写真をまとめてドロップ（またはファイルを選択）すると、自動で位置合わせして合成します。</li>
-          <li>「ナチュラル」は見た目に自然な露出フュージョン、「HDR」は暗部と明部をしっかり起こす HDR 調です。</li>
+          <li>「おまかせ」は約 3,500 シーンの写真で学習したモデルが写真らしいバランスに仕上げます。「ナチュラル」は露出フュージョン、「HDR」は暗部と明部をしっかり起こす HDR 調です。</li>
           <li>「効果の強さ」で合成の効き具合を、「ディテール」で立体感を調整できます。</li>
           <li>輪郭が二重に見えるときは「位置合わせ」→「手動で微調整する」で、ルーペを見ながら写真ごとに位置と傾きを直せます。</li>
           <li>「比較」で合成前と見比べ、仕上げを調整したら「画像を保存」。</li>
