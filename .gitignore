@@ -10,3 +10,5 @@ training/runs/
 training/eval/scenes/
 training/eval/out/
 __pycache__/
+training/leica/data/
+training/leica/out/

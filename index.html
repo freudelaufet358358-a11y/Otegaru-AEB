@@ -170,6 +170,18 @@
 
         <section class="card">
           <h2><span class="step">4</span>仕上げ <button type="button" class="link-button small" id="reset-adjust">リセット</button></h2>
+          <div class="segmented" role="radiogroup" aria-label="色の傾向">
+            <button type="button" role="radio" data-look="none" aria-checked="true">標準<small>カメラの色そのまま</small></button>
+            <button type="button" role="radio" data-look="leica-m10" aria-checked="false">Leica M10<small>センサー＋色づくり</small></button>
+          </div>
+          <div id="look-params" hidden>
+            <label class="slider"><span>Leica の効き</span><input type="range" id="look-amount" min="0" max="100" value="100" /><output></output></label>
+            <label class="switch">
+              <input type="checkbox" id="look-tone" />
+              <span>階調も Leica のカメラ内 JPEG に合わせる（暗部が沈み、メリハリが強くなります）</span>
+            </label>
+          </div>
+          <p class="hint" id="look-hint"></p>
           <label class="slider"><span>明るさ</span><input type="range" id="adj-brightness" min="-100" max="100" value="0" /><output></output></label>
           <label class="slider"><span>コントラスト</span><input type="range" id="adj-contrast" min="-100" max="100" value="0" /><output></output></label>
           <label class="slider"><span>彩度</span><input type="range" id="adj-saturation" min="-100" max="100" value="0" /><output></output></label>
@@ -212,6 +224,7 @@
           <li>「おまかせ」は約 3,500 シーンの写真で学習したモデルが写真らしいバランスに仕上げます。「ナチュラル」は露出フュージョン、「HDR」は暗部と明部をしっかり起こす HDR 調です。</li>
           <li>「効果の強さ」で合成の効き具合を、「ディテール」で立体感を調整できます。</li>
           <li>輪郭が二重に見えるときは「位置合わせ」→「手動で微調整する」で、ルーペを見ながら写真ごとに位置と傾きを直せます。</li>
+          <li>「仕上げ」の「Leica M10」を選ぶと、Leica M10 で撮ったような色（センサーの違いと Leica のカメラ内 JPEG の色づくり）になります。</li>
           <li>「比較」で合成前と見比べ、仕上げを調整したら「画像を保存」。</li>
         </ol>
         <h3>EOS R6 Mark II で撮るときのコツ</h3>

@@ -8,7 +8,9 @@ import { fitSize, fullView, resizeView, rowIndex, type Frame16, type View } from
 import { exposureFusion, type ProgressFn } from '../core/fusion';
 import { estimateExposures, toneMapHDR } from '../core/hdr';
 import { parseToneModel, predictGrid, radianceThumbnail, renderLearned, type ToneGrid, type ToneModel } from '../core/learned';
+import { DEFAULT_LOOK, LeicaLook, parseLookModel, type LookParams } from '../core/look';
 import { encodeTiff16 } from '../core/tiff';
+import lookModelJson from '../models/leica-m10.json';
 import modelUrl from '../models/tone-hdrplus.bin?url';
 import {
   angleDegrees,
@@ -28,9 +30,11 @@ import type {
   ExportOptions,
   FrameAlignment,
   FromWorker,
+  LookInfo,
   LoupeMode,
   ManualAdjust,
   PreparedInfo,
+  RawColor,
   RenderParams,
   ToWorker,
 } from './protocol';
@@ -40,6 +44,7 @@ interface Entry {
   name: string;
   frame: Frame16;
   exif: ExposureInfo;
+  color?: RawColor;
 }
 
 interface Prepared {
@@ -61,6 +66,10 @@ interface Prepared {
   layoutDirty: boolean;
   /** おまかせモードのグリッド（プレビュー用フレームから求め、書き出しでも同じものを使う） */
   toneGrid: ToneGrid | null;
+  /** Leica M10 の色（基準の写真の機種・ホワイトバランスに合わせて用意する） */
+  leica: LeicaLook;
+  /** 最後に送った比較用の画像（基準フレーム）に掛けた色の傾向 */
+  referenceLook: string;
 }
 
 const NO_MANUAL: ManualAdjust = { x: 0, y: 0, rotation: 0 };
@@ -70,6 +79,7 @@ const ctx = self as unknown as {
   onmessage: ((ev: MessageEvent<ToWorker>) => void) | null;
 };
 
+const lookModel = parseLookModel(lookModelJson);
 const entries = new Map<string, Entry>();
 let prepared: Prepared | null = null;
 let cache: { key: string; display: Uint16Array; width: number; height: number } | null = null;
@@ -97,7 +107,7 @@ async function handle(msg: ToWorker): Promise<void> {
   switch (msg.type) {
     case 'addRaw': {
       const frame: Frame16 = { width: msg.width, height: msg.height, data: msg.data, encoding: 'linear' };
-      entries.set(msg.id, { id: msg.id, name: msg.name, frame, exif: msg.exif });
+      entries.set(msg.id, { id: msg.id, name: msg.name, frame, exif: msg.exif, color: msg.color });
       invalidate();
       post({ type: 'added', id: msg.id, width: msg.width, height: msg.height, exif: msg.exif });
       break;
@@ -140,9 +150,9 @@ async function handle(msg: ToWorker): Promise<void> {
       const p = requirePrepared();
       const t = performance.now();
       let layout: { info: PreparedInfo; reference: Uint8ClampedArray } | undefined;
-      if (p.layoutDirty) {
+      if (p.layoutDirty || p.referenceLook !== lookKey(msg.params.look)) {
         ensureLayout(p);
-        layout = { info: p.info, reference: referenceRGBA(p) };
+        layout = { info: p.info, reference: referenceRGBA(p, msg.params.look) };
       }
       const key = baseKey(msg.params);
       if (!cache || cache.key !== key) {
@@ -155,6 +165,11 @@ async function handle(msg: ToWorker): Promise<void> {
       if (msg.params.amount < 1) {
         const ref = p.preview[p.refIndex];
         display = blendWithReference(display, fullView(ref), displayLut(ref.encoding), msg.params.amount, new Uint16Array(display.length));
+      }
+      if (msg.params.look.id !== 'none') {
+        // キャッシュを書き換えないよう、効果の強さで新しく作った配列でなければコピーに掛ける
+        const out = display === cache.display ? new Uint16Array(display.length) : display;
+        display = applyLook(p, msg.params.look, display, out, lookJpegBase(msg.params));
       }
       const rgba = new Uint8ClampedArray(cache.width * cache.height * 4);
       toRGBA8(display, msg.params.adjust, rgba);
@@ -293,6 +308,14 @@ function prepare(align: boolean, previewSide: number, progress: (label: string, 
     preview: [],
     layoutDirty: true,
     toneGrid: null,
+    leica: new LeicaLook(lookModel, {
+      encoding: sorted[refIndex].frame.encoding,
+      make: sorted[refIndex].exif.make,
+      model: sorted[refIndex].exif.model,
+      neutral: sorted[refIndex].color?.neutral,
+      camXyz: sorted[refIndex].color?.camXyz,
+    }),
+    referenceLook: 'none',
   };
   updateTransforms(p);
 
@@ -358,15 +381,42 @@ function ensureLayout(p: Prepared): void {
     alignment,
     relativeEv: p.info?.relativeEv ?? {},
     aligned: p.aligned,
+    look: lookInfo(p),
   };
 }
 
-/** 基準フレームをそのまま表示した画像（比較用） */
-function referenceRGBA(p: Prepared): Uint8ClampedArray {
+function lookInfo(p: Prepared): LookInfo {
+  return { encoding: p.entries[p.refIndex].frame.encoding, cameraMatched: p.leica.cameraMatched, cct: p.leica.cct };
+}
+
+function lookKey(look: LookParams): string {
+  return look.id === 'none' || look.amount <= 0 ? 'none' : `${look.id}:${look.amount}:${look.tone}`;
+}
+
+/**
+ * 合成結果に色の傾向を掛けるとき、表示用の値を「カメラ内 JPEG 並みのトーン」として戻す割合（LeicaLook.toLinear）。
+ * おまかせは HDR+ の仕上がり（カメラ内 JPEG 並みのメリハリ）を学習しているのでその分だけ、
+ * 効果の強さで基準フレーム（素の表示）と混ぜた分は素の表示として戻す
+ */
+function lookJpegBase(params: RenderParams): number {
+  return params.mode === 'learned' ? params.amount : 0;
+}
+
+/** 色の傾向（Leica M10 など）を表示用 16bit RGB に掛ける */
+function applyLook(p: Prepared, look: LookParams, src: Uint16Array, out: Uint16Array = src, jpegBase = 0): Uint16Array {
+  if (look.id === 'leica-m10') return p.leica.apply(src, look.amount, out, jpegBase, look.tone ? 1 : 0);
+  if (out !== src) out.set(src);
+  return out;
+}
+
+/** 基準フレームをそのまま表示した画像（比較用）。合成結果と同じ色の傾向を掛ける */
+function referenceRGBA(p: Prepared, look: LookParams = DEFAULT_LOOK): Uint8ClampedArray {
   const ref = p.preview[p.refIndex];
   const lut = displayLut(ref.encoding);
   const disp = new Uint16Array(ref.data.length);
   for (let i = 0; i < disp.length; i++) disp[i] = lut[ref.data[i]] * 65535 + 0.5;
+  applyLook(p, look, disp);
+  p.referenceLook = lookKey(look);
   const rgba = new Uint8ClampedArray(ref.width * ref.height * 4);
   toRGBA8(disp, DEFAULT_ADJUSTMENTS, rgba);
   return rgba;
@@ -498,6 +548,7 @@ async function exportImage(
     const ref = views[p.refIndex];
     blendWithReference(display, ref, displayLut(ref.frame.encoding), params.amount);
   }
+  applyLook(p, params.look, display, display, lookJpegBase(params));
   views = [];
   progress('ファイルを作成中', 1);
 

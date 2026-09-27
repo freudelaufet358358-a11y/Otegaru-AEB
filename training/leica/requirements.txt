@@ -1,0 +1,6 @@
+numpy
+scipy
+pillow
+rawpy
+opencv-python-headless
+colour-science

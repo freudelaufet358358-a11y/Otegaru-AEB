@@ -3,6 +3,7 @@
 // 合成に使うため、ガンマ補正や自動明るさ補正をかけない「リニアな 16bit sRGB」で取り出す。
 
 import { formatExifDate, type ExposureInfo } from './core/exif';
+import type { RawColor } from './worker/protocol';
 
 const RAW_EXTENSIONS = [
   'cr3', 'cr2', 'crw', 'nef', 'nrw', 'arw', 'srf', 'sr2', 'dng', 'raf', 'orf', 'rw2', 'pef', 'srw',
@@ -26,6 +27,8 @@ interface LibRawMetadata {
   shutter: number;
   aperture: number;
   timestamp: Date;
+  /** metadata(true) のときだけ入る */
+  color_data?: { cam_mul?: number[]; cam_xyz?: number[][] };
 }
 
 interface LibRawInstance {
@@ -59,6 +62,8 @@ export interface RawMeta {
   preview?: Blob;
   /** 画像の向き (LibRaw の flip: 0, 3=180°, 5=90°反時計回り, 6=90°時計回り) */
   flip: number;
+  /** 撮影時のホワイトバランスと色行列（取れなければ undefined） */
+  color?: RawColor;
 }
 
 export interface RawImage {
@@ -105,7 +110,8 @@ export class RawDecoder {
     } catch (e) {
       throw new Error(`RAW として開けませんでした（${(e as Error).message}）`);
     }
-    const m = await raw.metadata(false);
+    // 色の情報（color_data）は詳細なメタデータにしか入らない
+    const m = await raw.metadata(true).catch(() => raw.metadata(false));
     const exif: ExposureInfo = {
       exposureTime: m.shutter > 0 ? m.shutter : undefined,
       fNumber: m.aperture > 0 ? m.aperture : undefined,
@@ -121,7 +127,7 @@ export class RawDecoder {
     } catch {
       // プレビューがなくても現像はできる
     }
-    return { exif, preview, flip: m.flip };
+    return { exif, preview, flip: m.flip, color: rawColor(m) };
   }
 
   /** open() 済みのファイルを現像する（時間がかかる） */
@@ -138,6 +144,16 @@ export class RawDecoder {
     this.instance?.dispose();
     this.instance = null;
   }
+}
+
+/** 撮影時のホワイトバランスの倍率の逆数（カメラのニュートラル）と、XYZ → カメラ RGB の色行列 */
+function rawColor(m: LibRawMetadata): RawColor | undefined {
+  const mul = m.color_data?.cam_mul;
+  const xyz = m.color_data?.cam_xyz;
+  if (!mul || !xyz || xyz.length < 3 || !(mul[0] > 0 && mul[1] > 0 && mul[2] > 0)) return undefined;
+  const camXyz = xyz.slice(0, 3).flatMap((row) => row.slice(0, 3));
+  if (camXyz.length !== 9 || camXyz.every((v) => v === 0) || camXyz.some((v) => !Number.isFinite(v))) return undefined;
+  return { neutral: [mul[1] / mul[0], 1, mul[1] / mul[2]], camXyz };
 }
 
 /** サムネイル画像（object URL）を作る。flip は RAW の向き情報 */

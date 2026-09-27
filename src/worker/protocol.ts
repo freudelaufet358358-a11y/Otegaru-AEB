@@ -5,6 +5,7 @@ import type { ExposureInfo } from '../core/exif';
 import type { FusionWeights } from '../core/fusion';
 import type { ToneParams } from '../core/hdr';
 import type { LearnedParams } from '../core/learned';
+import type { LookParams } from '../core/look';
 
 /** learned: 学習済みモデル（おまかせ）、fusion: 露出フュージョン（ナチュラル）、hdr: トーンマッピング */
 export type Mode = 'learned' | 'fusion' | 'hdr';
@@ -16,7 +17,27 @@ export interface RenderParams {
   fusion: FusionWeights;
   tone: ToneParams;
   learned: LearnedParams;
+  /** 色の傾向（Leica M10 など）。合成・効果の強さの後、仕上げ調整の前に掛ける */
+  look: LookParams;
   adjust: Adjustments;
+}
+
+/** RAW の色の情報（撮影時のホワイトバランスと色行列）。色温度の推定に使う */
+export interface RawColor {
+  /** カメラのニュートラル（ホワイトバランスの倍率の逆数、G = 1） */
+  neutral: [number, number, number];
+  /** XYZ → カメラ RGB（D65、行優先 9 要素） */
+  camXyz: number[];
+}
+
+/** 色の傾向を掛けるときの前提（基準の写真から決まる） */
+export interface LookInfo {
+  /** 基準の写真が RAW（linear）か JPEG など（srgb）か */
+  encoding: 'linear' | 'srgb';
+  /** 機種の分光感度データでセンサーの違いを変換したか */
+  cameraMatched: boolean;
+  /** 撮影時の色温度の推定値 [K] */
+  cct?: number;
 }
 
 export type ExportFormat = 'jpeg' | 'png' | 'tiff';
@@ -57,10 +78,11 @@ export interface PreparedInfo {
   /** ID → 画像から推定した基準比の露出 (EV) */
   relativeEv: Record<string, number>;
   aligned: boolean;
+  look: LookInfo;
 }
 
 export type ToWorker =
-  | { type: 'addRaw'; id: string; name: string; width: number; height: number; data: Uint16Array; exif: ExposureInfo }
+  | { type: 'addRaw'; id: string; name: string; width: number; height: number; data: Uint16Array; exif: ExposureInfo; color?: RawColor }
   | { type: 'addFile'; id: string; name: string; file: File }
   | { type: 'remove'; id: string }
   | { type: 'prepare'; reqId: number; align: boolean; previewSide: number }
@@ -81,7 +103,7 @@ export type FromWorker =
       height: number;
       rgba: Uint8ClampedArray;
       elapsed: number;
-      /** 手動調整などで切り抜き範囲が変わったときだけ入る */
+      /** 手動調整などで切り抜き範囲が変わったとき、または色の傾向が変わって比較用の画像を作り直したときだけ入る */
       layout?: { info: PreparedInfo; reference: Uint8ClampedArray };
     }
   | { type: 'loupe'; reqId: number; size: number; rgba: Uint8ClampedArray }

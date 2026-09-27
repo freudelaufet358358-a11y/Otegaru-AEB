@@ -2,6 +2,7 @@ import './style.css';
 import { ensureCrossOriginIsolation } from './coi';
 import { readExif, formatShutter, type ExposureInfo } from './core/exif';
 import { DEFAULT_FUSION_WEIGHTS } from './core/fusion';
+import type { LookId } from './core/look';
 import { isRawFile, makeThumbnail, RAW_ACCEPT, RawDecoder } from './raw';
 import type { ExportFormat, FromWorker, LoupeMode, ManualAdjust, Mode, PreparedInfo, RenderParams, ToWorker } from './worker/protocol';
 
@@ -48,6 +49,9 @@ const el = {
   loupeOverlay: $('loupe-overlay'),
   nudgeStep: $<HTMLSelectElement>('nudge-step'),
   manualReadout: $('manual-readout'),
+  lookParams: $('look-params'),
+  lookHint: $('look-hint'),
+  lookTone: $<HTMLInputElement>('look-tone'),
 };
 
 const MODE_HINTS: Record<Mode, string> = {
@@ -58,6 +62,8 @@ const MODE_HINTS: Record<Mode, string> = {
 };
 
 const MODE_NAMES: Record<Mode, string> = { learned: 'おまかせ', fusion: 'ナチュラル', hdr: 'HDR' };
+
+const LOOK_NAMES: Record<LookId, string> = { none: '', 'leica-m10': 'Leica M10' };
 
 // ---------------------------------------------------------------------------
 // 合成ワーカーとの通信
@@ -207,7 +213,7 @@ async function loadRaw(item: Item, version: number): Promise<void> {
     const img = await decoder.develop();
     if (stale()) return;
     await addToWorker(
-      { type: 'addRaw', id: item.id, name: item.file.name, width: img.width, height: img.height, data: img.data, exif: meta.exif },
+      { type: 'addRaw', id: item.id, name: item.file.name, width: img.width, height: img.height, data: img.data, exif: meta.exif, color: meta.color },
       [img.data.buffer],
     );
     if (stale()) return;
@@ -446,6 +452,7 @@ async function renderOnce(gen: number, showProgress: boolean): Promise<void> {
       `${prepared.width}×${prepared.height}`,
       `${prepared.order.length}枚`,
       MODE_NAMES[params.mode],
+      ...(params.look.id !== 'none' && params.look.amount > 0 ? [LOOK_NAMES[params.look.id]] : []),
       !prepared.aligned ? '位置合わせオフ' : shift < 0.05 && rotation < 0.005 ? 'ずれなし' : `位置補正 ${shift.toFixed(1)}px・${rotation.toFixed(2)}°`,
     ].join(' · ');
   } catch (e) {
@@ -458,6 +465,7 @@ function applyLayout(info: PreparedInfo, reference: Uint8ClampedArray): void {
   prepared = info;
   drawRGBA(el.before, reference, info.previewWidth, info.previewHeight);
   updateAlignmentUI();
+  updateLookHint();
 }
 
 /** 自動位置合わせで補正した最大の移動量 [px] と回転 [度] */
@@ -499,6 +507,7 @@ function hideBusy(): void {
 // パラメータ
 
 let mode: Mode = 'learned';
+let look: LookId = 'none';
 
 const sliders = {
   amount: $<HTMLInputElement>('amount'),
@@ -513,6 +522,7 @@ const sliders = {
   brightness: $<HTMLInputElement>('adj-brightness'),
   contrast: $<HTMLInputElement>('adj-contrast'),
   saturation: $<HTMLInputElement>('adj-saturation'),
+  lookAmount: $<HTMLInputElement>('look-amount'),
   quality: el.exportQuality,
 };
 
@@ -528,6 +538,7 @@ const formats: Partial<Record<keyof typeof sliders, (v: number) => string>> = {
   brightness: (v) => (v > 0 ? `+${v}` : `${v}`),
   contrast: (v) => (v > 0 ? `+${v}` : `${v}`),
   saturation: (v) => (v > 0 ? `+${v}` : `${v}`),
+  lookAmount: (v) => `${v}%`,
 };
 
 function num(input: HTMLInputElement): number {
@@ -548,6 +559,7 @@ function currentParams(): RenderParams {
     },
     tone: { strength: num(sliders.toneStrength) / 100, detail: num(sliders.toneDetail) / 100 },
     learned: { exposure: num(sliders.learnedExposure) / 10 },
+    look: { id: look, amount: num(sliders.lookAmount) / 100, tone: el.lookTone.checked },
     adjust: {
       brightness: num(sliders.brightness),
       contrast: num(sliders.contrast),
@@ -571,6 +583,38 @@ function setMode(m: Mode): void {
   for (const p of document.querySelectorAll<HTMLElement>('.mode-params')) p.hidden = p.dataset.for !== m;
   el.modeHint.textContent = MODE_HINTS[m];
   requestRender();
+}
+
+function setLook(id: LookId): void {
+  look = id;
+  for (const b of document.querySelectorAll<HTMLButtonElement>('[data-look]')) {
+    b.setAttribute('aria-checked', String(b.dataset.look === id));
+  }
+  el.lookParams.hidden = id === 'none';
+  updateLookHint();
+  requestRender();
+}
+
+/** 色の傾向の説明。Leica M10 のときは、センサーの違いをどう変換したか（機種・光源）も添える */
+function updateLookHint(): void {
+  if (look === 'none') {
+    el.lookHint.textContent = 'RAW はカメラの色を正確に再現した癖の少ない色、JPEG は撮ったときの色のままです。';
+    return;
+  }
+  const parts = [
+    'Leica M10 のセンサーの色の出方と、Leica のカメラ内 JPEG の色づくり（Canon の JPEG より彩度は控えめ、肌は赤み寄り、黄緑は黄み寄り）を再現します。',
+    el.lookTone.checked ? '階調も Leica のカメラ内 JPEG のトーンカーブにします。' : '明るさは合成結果のまま残します。',
+  ];
+  const info = prepared?.look;
+  if (info) {
+    if (info.encoding === 'srgb') parts.push('JPEG は Canon のピクチャースタイル「スタンダード」の色を打ち消してから変換します。');
+    if (info.cameraMatched) {
+      parts.push(`この機種の分光感度から変換しています${info.cct ? `（光源の色温度 約 ${Math.round(info.cct / 100) * 100}K）` : ''}。`);
+    } else {
+      parts.push('この機種の分光感度データがないため、色を正確に写すカメラとして変換しています。');
+    }
+  }
+  el.lookHint.textContent = parts.join('');
 }
 
 // ---------------------------------------------------------------------------
@@ -784,7 +828,8 @@ async function doExport(): Promise<void> {
     const ref = items.get(prepared.referenceId);
     const base = (ref?.file.name ?? 'image').replace(/\.[^.]+$/, '');
     const ext = format === 'jpeg' ? 'jpg' : format === 'png' ? 'png' : 'tif';
-    download(res.blob, `${base}_${params.mode === 'hdr' ? 'HDR' : 'AEB'}.${ext}`);
+    const suffix = params.look.id === 'leica-m10' && params.look.amount > 0 ? '_M10' : '';
+    download(res.blob, `${base}_${params.mode === 'hdr' ? 'HDR' : 'AEB'}${suffix}.${ext}`);
     el.exportHint.textContent = `${res.width}×${res.height}（${formatBytes(res.blob.size)}）を保存しました · ${(res.elapsed / 1000).toFixed(1)} 秒`;
   } catch (e) {
     el.exportHint.classList.add('error');
@@ -883,6 +928,13 @@ function bindEvents(): void {
   for (const b of document.querySelectorAll<HTMLButtonElement>('.segmented [data-mode]')) {
     b.onclick = () => setMode(b.dataset.mode as Mode);
   }
+  for (const b of document.querySelectorAll<HTMLButtonElement>('[data-look]')) {
+    b.onclick = () => setLook(b.dataset.look as LookId);
+  }
+  el.lookTone.onchange = () => {
+    updateLookHint();
+    requestRender();
+  };
   for (const input of Object.values(sliders)) {
     input.addEventListener('input', () => {
       updateOutputs();
@@ -962,6 +1014,7 @@ async function init(): Promise<void> {
   bindEvents();
   updateOutputs();
   setMode('learned');
+  setLook('none');
   updateExportState();
   const isolated = await ensureCrossOriginIsolation();
   if (!isolated) {

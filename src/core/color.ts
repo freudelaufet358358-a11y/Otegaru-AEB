@@ -20,6 +20,13 @@ export function shoulder(x: number): number {
   return KNEE + r * (1 - Math.exp(-(x - KNEE) / r));
 }
 
+/** shoulder の逆関数（1 に近づくほど大きな値に戻る） */
+export function shoulderInverse(y: number): number {
+  if (y <= KNEE) return y;
+  const r = 1 - KNEE;
+  return KNEE - r * Math.log(1 - (Math.min(y, 1 - 1e-6) - KNEE) / r);
+}
+
 /** Rec.709 / sRGB の輝度係数 */
 export const LUMA_R = 0.2126;
 export const LUMA_G = 0.7152;
